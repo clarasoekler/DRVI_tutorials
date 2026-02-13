@@ -273,14 +273,9 @@ drvi.utils.pl.plot_latent_dims_in_heatmap(embed, "final_annotation", title_col="
 #
 # Tools to Compare:
 # * CellTypist: Utilizing the Immune_All_Low.pkl or High models for automated labeling.
-# * Single R
-# * Reference Mapping (Scanpy Ingest/scArches): Projecting query data onto a high-quality PBMC/Immune atlas.
-# * Direct Regression: Using a Logistic Regression classifier to see if factors linearly predict known cell types.
 #
 # Key Metrics:
-# * LMS-SMI (Scaled Mutual Information): Measures the exclusivity of a factor for a specific label. High SMI = high disentanglement.
-# * LMS-SPN (Same-Process Neighbors): Evaluates if cells with the same annotation are closer in the latent space.
-# * Diagonalization: Visual assessment via Heatmaps to see if factors have 1-to-1 mappings to cell types.
+#
 
 # %% [markdown]
 # #### 1.1 Cell Typist
@@ -444,7 +439,156 @@ quant_df.head(10)
 # Key Metrics:
 
 # %% [markdown]
+# #### 2.1 Blitzqseq
+
+# %% [markdown]
+# How it works:
+# * Input: Ranked gene list (list of all genes sorted by loadings for a specific factor)
+# * Reference: MSigDB
+#     * Key Collections:
+#         * H (Hallmark): Broad biological states (e.g., "Hypoxia", "Inflammatory Response").
+#         * C5 (GO): Highly specific Gene Ontology terms.
+#         * C2 (CP): Curated pathways from Reactome or KEGG.
+# * Algorithm: 
+#     * Pre-ranking: Unlike standard GSEA which compares groups of cells, this version only looks at the ranking of genes
+#     * It calculates an Enrichment Score (ES) that increases when genes from a specific pathway appear at the top of your ranked list (high loadings)
+#     * Speed Optimization: BlitzGSEA uses a probability distribution approximation to estimate the null model. Instead of running thousands of slow permutations for every gene set, it uses mathematical shortcuts to calculate p-values almost instantly
+# * Output: 
+#     * NES (Normalized Enrichment Score): A high positive NES indicates that the biological process is strongly represented by that factor
+#     * p-value & FDR (q-value): Statistical significance. Usually, you filter for FDR<0.05
+#     * Leading Edge Genes: The specific subset of genes within a pathway that actually drove the enrichment score
+
+# %% [markdown]
+# ##### Import
+
+# %%
+import blitzgsea as blitz 
+import pandas as pd
+
+
+# %%
+# 1. load data base (MSigDB Hallmark is the gold standard for the first evaluation)
+signature_lib = blitz.enrichr.get_library("MSigDB_Hallmark_2020")
+
+# 2. Extract reconstruction effects 
+# This matrix shows: Gene x Factor
+
+recon_effects = model.get_max_effect_of_splits_within_distribution(adata=adata)
+recon_effects_t = recon_effects.T
+
+# covert into data frame for easier handling
+# index=2000 genes, columns=128 factors
+scores_df = pd.DataFrame(
+    recon_effects_t,
+    index=adata.var_names,
+    columns=embed.var['title']
+)
+
+#Ensure that only active factors are included in the GSEA
+if 'vanished' in embed.var:
+    active_factors = embed.var[embed.var['vanished'] == False]['title']
+    scores_df = scores_df[active_factors]
+
+print(f"Input ready: {scores_df.shape[1]} active factors ready for annotation.")
+
+
+# %% [markdown]
+# ##### GSEA
+
+# %%
+gsea_results = []
+gsea_results = []
+for factor in scores_df.columns:
+    # 1. Extract the factor as a Series
+    sig_series = scores_df[factor]
+    
+    # 2. Important: transform in DataFrame and rename columns for blitzgsea
+    # 'i' = gene-name (index), 'v' = value (effect)
+    signature = sig_series.reset_index()
+    signature.columns = ['i', 'v']
+    
+    # 3. GSEA calculation (blitzgsea sorts internally)
+    try:
+        res = blitz.gsea(signature, signature_lib)
+        
+        # filter significant results 
+        top = res[res['fdr'] < 0.05].sort_values('nes', ascending=False)
+        
+        if not top.empty:
+            gsea_results.append({
+                'Factor': factor,
+                'Term': top.iloc[0].name,
+                'NES': top.iloc[0]['nes'],
+                'FDR': top.iloc[0]['fdr']
+            })
+        else:
+            gsea_results.append({
+                'Factor': factor,
+                'Term': 'No significant enrichment',
+                'NES': 0,
+                'FDR': 1
+            })
+    except Exception as e:
+        print(f"Fehler bei Faktor {factor}: {e}")
+
+# Summary
+gsea_summary = pd.DataFrame(gsea_results)
+
+# %% [markdown]
+# ##### Evaluation of tool
+
+# %%
+gsea_summary = pd.DataFrame(gsea_results)
+
+total_factors = len(gsea_summary)
+annotated_factors = len(gsea_summary[gsea_summary['Term'] != 'No significant enrichment'])
+coverage = (annotated_factors / total_factors) * 100
+
+print(f"--- Evaluation Summary for BlitzGSEA ---")
+print(f"Annotation Coverage: {coverage:.2f}%")
+print(f"Identified: {annotated_factors} / {total_factors} Factors.")
+
+# Visualize
+# Only show factors with significant annotation and sort by NES
+plot_df = gsea_summary[gsea_summary['Term'] != 'No significant enrichment'].head(15)
+
+if not plot_df.empty:
+    plt.figure(figsize=(10, 6))
+    sns.barplot(data=plot_df, x='NES', y='Term', hue='Factor', palette='hls', dodge=False)
+    plt.title("Top Biological Annotations per Factor (BlitzGSEA)")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.show()
+
+# %%
+# 1.Calculate Metrics
+total_factors = len(scores_df.columns)
+annotated = gsea_summary[gsea_summary['Term'] != 'No significant enrichment']
+coverage = (len(annotated) / total_factors) * 100
+
+# Specificity: How many terms are unique?
+unique_terms = annotated['Term'].nunique()
+specificity_ratio = (unique_terms / len(annotated)) * 100 if len(annotated) > 0 else 0
+
+# Singal Strength: Median NES of annotated factors
+median_nes = annotated['NES'].median()
+
+# 2. Summary Report
+print(f"--- BlitzGSEA Evaluation Report ---")
+print(f"1. Coverage: {coverage:.2f}% ({len(annotated)} von {total_factors} Faktoren)")
+print(f"2. Spezifität: {specificity_ratio:.2f}% ({unique_terms} einzigartige Begriffe)")
+print(f"3. Signalstärke (Median NES): {median_nes:.2f}")
+print(f"-----------------------------------")
+
+# 3. Top-Faktoren nach Signalstärke anzeigen
+print("Top 5 annotierte Faktoren:")
+print(annotated.sort_values('NES', ascending=False).head(20))
+
+# %% [markdown]
 # ### 3. Language Model Based Identification (Advanced Annotation)
+
+# %% [markdown]
+#
 
 # %% [markdown]
 # Goal: Automate "narrative" annotation and validation using LLMs.
