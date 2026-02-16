@@ -337,8 +337,20 @@ factor_ids = embed.var[factor_id_col].astype(str).tolist()
 #
 # Tools to Compare:
 # * CellTypist: Utilizing the Immune_All_Low.pkl or High models for automated labeling.
+# * GSEA: 
+#     * Azimuth 2023 or Azimuth_Cell_Types_2021 (Reference Marker lists from Human Biomolecular Atlas Program)
+#     * PanglaoDB_Augmented_2021 (Mouse and Human) --> clean markers lists
+#     * HuBMAP_ASCTplusB_augmented_2022 (Anatomical Structures, Cell Typs, Biomarkers) --> very well curated, strict anatomical hierarchy
+#     * Descartes_Cell_Types_and_Tissue_2021 (Human Cell Atlas) --> broad level annotation
+#     * Tabula Sapiens (one of the biggest Single Cell Atlases, 24 Organs)
+#     * ...
+#
+#
+#
 #
 # Key Metrics:
+# * Correlation
+# * Specificity
 #
 
 # %% [markdown]
@@ -418,6 +430,37 @@ plt.show()
 
 
 # %% [markdown]
+# #### CellTypist Validation
+
+# %%
+factor_to_check = "DR 36"
+adata.obs["factor_check"] = drvi_factors[factor_to_check].reindex(adata.obs_names)
+
+# %% [markdown]
+# UMAP
+
+# %%
+sc.pl.umap(
+    adata,
+    color=["factor_check", "celltypist_majority"],
+    ncols=2,
+    frameon=False,
+    cmap="viridis",
+)
+
+
+# %% [markdown]
+# Violin Plot
+
+# %%
+sc.pl.violin(
+    adata,
+    keys="factor_check",
+    groupby="celltypist_majority",
+    rotation=90
+)
+
+# %% [markdown]
 # #### CellTypist Summary
 
 # %%
@@ -469,11 +512,14 @@ display(celltypist_summary[celltypist_summary['Significant']].head(20))
 # %% [markdown]
 # How it works:
 # * Input: Ranked gene list (list of all genes sorted by loadings for a specific factor)
-# * Reference: MSigDB
-#     * Key Collections:
-#         * H (Hallmark): Broad biological states (e.g., "Hypoxia", "Inflammatory Response").
-#         * C5 (GO): Highly specific Gene Ontology terms.
-#         * C2 (CP): Curated pathways from Reactome or KEGG.
+# * Reference: Database on Enrichr
+#     * Key Collections: 
+#         * e.g MgSigDB
+#             * H (Hallmark): Broad biological states (e.g., "Hypoxia", "Inflammatory Response").
+#             * C5 (GO): Highly specific Gene Ontology terms.
+#             * C2 (CP): Curated pathways from Reactome or KEGG.
+#         * Cellmarker/Azimuth
+#         * Reactome/KEGG
 # * Algorithm: 
 #     * Pre-ranking: Unlike standard GSEA which compares groups of cells, this version only looks at the ranking of genes
 #     * It calculates an Enrichment Score (ES) that increases when genes from a specific pathway appear at the top of your ranked list (high loadings)
@@ -616,7 +662,150 @@ display(comparison.sort_values(['Relationship', 'Factor']).head(50))
 
 
 # %% [markdown]
-# #### 2.2 Gseapy
+# ### 2.2 Gseapy (Preranking Module)
+
+# %% [markdown]
+# How it works:
+# * Input: 
+#     * Ranked gene list (list of all genes sorted by loadings for a specific factor) for Preranked Module [Important: Gene names have to be in capital letters]
+#     * Gene expression matrix and group annotation for classical module
+# * Reference: Database on Enrichr
+#     * Key Collections: 
+#         * e.g MgSigDB
+#             * H (Hallmark): Broad biological states (e.g., "Hypoxia", "Inflammatory Response").
+#             * C5 (GO): Highly specific Gene Ontology terms.
+#             * C2 (CP): Curated pathways from Reactome or KEGG.
+#         * Cellmarker/Azimuth
+#         * Reactome/KEGG
+# * Algorithm: 
+#     * Pre-ranking: Unlike standard GSEA which compares groups of cells, this version only looks at the ranking of genes
+#     * It calculates an Enrichment Score (ES) that increases when genes from a specific pathway appear at the top of your ranked list (high loadings)
+#     * Permutation-based Null Model: It randomly reassigns gene labels many times (default is 1000 iterations) to see how often a similar ES occurs by pure chance
+# * Output: 
+#     * NES (Normalized Enrichment Score): A high positive NES indicates that the biological process is strongly represented by that factor
+#     * FDR (q-value): Statistical significance. Usually, you filter for FDR<0.05
+#     * Lead_genes: The specific subset of genes within a pathway that actually drove the enrichment score
+
+# %% [markdown]
+# #### Gseapy Import
+#
+
+# %%
+import gseapy as gp
+
+# %% [markdown]
+# #### Choosing Gseapy Database
+
+# %%
+gseapy_db = "MSigDB_Hallmark_2020"
+print("Using DB:", gseapy_db)
+
+# %% [markdown]
+# #### Get Gene Library
+
+# %%
+gseapy_lib= blitz.enrichr.get_library(gseapy_db)
+print("Gene sets:", len(gseapy_lib))
+
+# %% [markdown]
+# #### Preparing Data
+
+# %%
+scores_df.index = scores_df.index.str.upper()
+
+# %% [markdown]
+# #### Run Gseapy Prerank Loop
+#
+
+# %%
+gseapy_results = []
+
+for factor_dir in scores_df.columns:
+    signature = (
+        scores_df[factor_dir]
+        .rename("score")
+        .reset_index()
+        .rename(columns={"index": "gene"})
+    )
+
+    signature["score"] = pd.to_numeric(signature["score"], errors="coerce")
+    signature = signature.replace([np.inf, -np.inf], np.nan).dropna(subset=["score"])
+    signature = signature.drop_duplicates(subset=["gene"]).sort_values("score", ascending=False)
+
+    try:
+        pre_res = gp.prerank(
+            rnk=signature[["gene", "score"]],
+            gene_sets=gseapy_lib, 
+            outdir=None, #to avoid file output
+            min_size=5, #minimum gene set size to consider (to avoid very small sets that are hard to interpret)
+            max_size=500, #maximum gene set size to consider (to avoid very broad terms)
+            permutation_num=100, #number of permutations for significance testing
+            seed=42, #random seed
+            verbose=False, #to see progress and potential warnings during GSEA runs
+        )
+
+        res_df = pre_res.res2d.copy().sort_values("FDR q-val", ascending=True)
+
+        if len(res_df):
+            top = res_df.iloc[0]
+            term_name = top["Term"] if "Term" in res_df.columns else res_df.index[0]
+
+            gseapy_results.append({
+                "FactorDir": factor_dir,
+                "Factor": factor_dir[:-1],
+                "Direction": factor_dir[-1],
+                "Term": str(term_name),
+                "NES": float(top["NES"]),
+                "FDR": float(top["FDR q-val"]),
+            })
+        else:
+            gseapy_results.append({
+                "FactorDir": factor_dir, "Factor": factor_dir[:-1], "Direction": factor_dir[-1],
+                "Term": "No significant enrichment", "NES": 0.0, "FDR": 1.0
+            })
+
+    except Exception as e:
+        gseapy_results.append({
+            "FactorDir": factor_dir, "Factor": factor_dir[:-1], "Direction": factor_dir[-1],
+            "Term": f"ERROR: {type(e).__name__}", "NES": 0.0, "FDR": 1.0
+        })
+
+gseapy_summary = pd.DataFrame(gseapy_results)
+
+
+
+# %%
+#Visualize GSEA results
+display(
+    gseapy_summary[gseapy_summary["FDR"] < gsea_fdr_threshold]
+    .sort_values(["FDR", "NES"], ascending=[True, False])
+)
+
+# %% [markdown]
+# #### Gseapy Summary
+#
+
+# %%
+gseapy_tool_summary = gseapy_summary.copy()
+gseapy_tool_summary["Tool"] = "gseapy"
+gseapy_tool_summary["Label"] = gseapy_tool_summary["Term"].astype(str)
+gseapy_tool_summary["Label_std"] = (
+    gseapy_tool_summary["Label"]
+    .str.lower()
+    .str.replace(r"[^a-z0-9]+", "_", regex=True)
+    .str.strip("_")
+)
+gseapy_tool_summary["Significant"] = gseapy_tool_summary["FDR"] < gsea_fdr_threshold
+
+annotated_gseapy = gseapy_tool_summary[gseapy_tool_summary["Significant"]].copy()
+coverage_gseapy = (100 * len(annotated_gseapy) / len(gseapy_tool_summary)) if len(gseapy_tool_summary) else 0
+
+print(f"Gseapy coverage (FDR<{gsea_fdr_threshold}): {coverage_gseapy:.2f}% ({len(annotated_gseapy)}/{len(gseapy_tool_summary)})")
+print(f"Unique terms: {annotated_gseapy['Term'].nunique()}")
+print(f"Median NES: {annotated_gseapy['NES'].median():.2f}" if len(annotated_gseapy) else "Median NES: n/a")
+
+display(annotated_gseapy.sort_values("FDR", ascending=True).head(20))
+
 
 # %% [markdown]
 # ### 3. Language Model Based Identification (Advanced Annotation)
