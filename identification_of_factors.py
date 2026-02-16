@@ -263,10 +263,74 @@ drvi.utils.pl.plot_latent_dims_in_heatmap(embed, "final_annotation", title_col="
 # # Exploration Roadmap: DRVI Factor Annotation Pipeline
 
 # %% [markdown]
+# ## General Roadmap Settings
+#
+
+# %% [markdown]
+# ### General Configurations
+
+# %%
+filter_vanished = True
+factor_id_col = "title"   # keeps factor labels stable across tools (e.g. "DR 36")
+
+# Comparison thresholds
+corr_threshold = 0.4
+spec_threshold = 0.1
+gsea_fdr_threshold = 0.05
+
+
+# %% [markdown]
 # This roadmap outlines the systematic evaluation of tools for annotating latent factors. The goal is to move from abstract dimensions to interpretable biological processes using the immune dataset as a pilot.
 
 # %% [markdown]
-# ### 1. Statistical Annotation & Similarity 
+# ### Shared Data Setup
+
+# %%
+import celltypist
+from celltypist import models
+import blitzgsea as blitz
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+
+# %% [markdown]
+# ### Sync Cells
+#
+
+# %%
+# make sure indices of adata and embed are the same
+common_cells = adata.obs_names.intersection(embed_full.obs_names)
+adata = adata[common_cells].copy()
+embed_full = embed_full[common_cells].copy()
+print(f"Cells: {adata.n_obs}")
+
+
+# %% [markdown]
+# ### Factor Filter
+#
+
+# %%
+if filter_vanished and 'vanished' in embed_full.var.columns:
+    mask = ~embed_full.var['vanished'].astype(bool).values
+else:
+    mask = np.ones(embed_full.n_vars, dtype=bool)
+embed = embed_full[:, mask].copy()
+print(f"Factors used: {embed.n_vars} | filter_vanished={filter_vanished}")
+
+
+# %% [markdown]
+# ### Standardized Factor IDs
+
+# %%
+if factor_id_col not in embed.var.columns:
+    embed.var[factor_id_col] = [f"Factor_{i}" for i in range(embed.n_vars)]
+factor_ids = embed.var[factor_id_col].astype(str).tolist()
+
+
+# %% [markdown]
+# ## 1. Statistical Annotation & Similarity 
 
 # %% [markdown]
 # Goal: Map latent factors to known cell types using existing annotations and atlases.
@@ -278,7 +342,7 @@ drvi.utils.pl.plot_latent_dims_in_heatmap(embed, "final_annotation", title_col="
 #
 
 # %% [markdown]
-# #### 1.1 Cell Typist
+# ### 1.1 Cell Typist
 
 # %% [markdown]
 # * Input: normalized gene expression matrix of cells
@@ -294,69 +358,35 @@ drvi.utils.pl.plot_latent_dims_in_heatmap(embed, "final_annotation", title_col="
 #
 
 # %% [markdown]
-# ##### Importing Libraries
-
-# %%
-import celltypist
-from celltypist import models
-import pandas as pd
-import seaborn as sns
-import numpy as np
-import matplotlib.pyplot as plt
-
-# %% [markdown]
-# ##### Setup and Load data
-
-# %%
-#make sure indices of adata and embed are the same, so we can transfer factors to adata object
-
-#Load data
-embed = sc.read_h5ad("/Users/clara.sanchez/Documents/code/drvi_project/drvi_tutorials/tmp_io/drvi_immune_128/embed.h5ad")
-adata = sc.read_h5ad("/Users/clara.sanchez/Documents/code/drvi_project/drvi_tutorials/tmp_io/drvi_immune_128/adata_preprocesses.h5ad")  
-
-#Synchronize barcodes
-common_cells = adata.obs_names.intersection(embed.obs_names)
-adata = adata[common_cells].copy()
-embed = embed[common_cells].copy()
-
-#Transfer factors
-for i in range(embed.X.shape[1]):
-    adata.obs[f'DRVI_F_{i}'] = embed.X[:, i]
-
-print(f"Synchronized! Both objects have {adata.n_obs} cells.")
-
-# %% [markdown]
-# ##### Download Celltypist Model
+# #### CellTypist Model
 
 # %%
 #download celltypist model
 print(models.models_description())
 model_name = 'Immune_All_Low.pkl'
-model = models.download_models(force_update=True, model=model_name)
+models.download_models(force_update=True, model=model_name)
+ct_model = models.Model.load(model=model_name)
 
-
-#download recommended model for immune cells
-model = models.Model.load(model = 'Immune_All_Low.pkl')
-
+#load recommended model for immune cells
+ct_model = models.Model.load(model=model_name)
 print(model.cell_types)
 
-
 # %% [markdown]
-# ##### Annotate Cells
+# #### CellTypist Annotation
+#
 
 # %%
-#Annotation
-predictions = celltypist.annotate(adata, model = 'Immune_All_Low.pkl', majority_voting = True)
+# Annotate cell types using CellTypist
+predictions = celltypist.annotate(adata, model=model_name, majority_voting=True)
+
 adata.obs['celltypist_labels'] = predictions.predicted_labels['predicted_labels']
+
 adata.obs['celltypist_majority'] = predictions.predicted_labels['majority_voting']
 
 # %% [markdown]
-# ##### Extract Probability Matrix
+# #### Extract Probability Matrix
 
 # %%
-# The Decision Matrix contains raw logit scores (useful for confidence checks)
-decision_matrix = predictions.decision_matrix
-
 # The Probability Matrix contains sigmoid-transformed scores (0 to 1)
 # This is the primary input for the factor correlation analysis
 prob_matrix = predictions.probability_matrix
@@ -366,66 +396,61 @@ prob_matrix.index = adata.obs_names
 print(f"Modell knows {prob_matrix.shape[1]} different Immune cell types.")
 
 # %% [markdown]
-# ##### Quantitative Evaluation (Correlation with DRVI factors)
+# #### CellTypist Factor Correlation 
 
 # %%
-# Extract DRVI factors from the latent representation
-## The .X matrix  contains the latent representations
-adata.obsm['X_drvi'] = embed.X
+drvi_factors = pd.DataFrame(embed.X, index=embed.obs_names, columns=factor_ids)
 
-drvi_factors = pd.DataFrame(adata.obsm['X_drvi'], index=adata.obs_names)
-drvi_factors.columns = [f'Factor_{i}' for i in range(drvi_factors.shape[1])]
-
-# Calculate Correlation between each Factor and each CellTypist Identity
+# correlation: factor vs CellTypist class probabilities
 eval_matrix = pd.DataFrame(
     np.corrcoef(drvi_factors.T, prob_matrix.T)[:drvi_factors.shape[1], drvi_factors.shape[1]:],
     index=drvi_factors.columns,
-    columns=prob_matrix.columns
+    columns=prob_matrix.columns,
 )
 
-# Plotting the Evaluation Heatmap
-plt.figure(figsize=(20, 10))
-sns.heatmap(eval_matrix, cmap='RdBu_r', center=0)
-plt.title("Evaluation: Concordance between DRVI Factors and CellTypist Probabilities")
-plt.show()
-
-# %% [markdown]
-# #### Factor Assignment Table with a Specificity Score
 
 # %%
-# 1. Extract the Top Match and the second-best match using 'eval_matrix'
+#Visualize the correlation matrix as a heatmap
+plt.figure(figsize=(20, 10))
+sns.heatmap(eval_matrix, cmap='RdBu_r', center=0)
+plt.title("Concordance between DRVI factors and CellTypist probabilities")
+plt.show()
+
+
+# %% [markdown]
+# #### CellTypist Summary
+
+# %%
+# top and second-best label per factor
 top_1 = eval_matrix.idxmax(axis=1)
 top_1_val = eval_matrix.max(axis=1)
+tmp = eval_matrix.copy()
+for i, c in enumerate(top_1):
+    tmp.iloc[i, tmp.columns.get_loc(c)] = -1
 
-# To find the 2nd best, we temporarily mask the top one
-temp_matrix = eval_matrix.copy()
-for i, col in enumerate(top_1):
-    temp_matrix.loc[temp_matrix.index[i], col] = -1
-top_2_val = temp_matrix.max(axis=1)
+# Calculate specificity as the difference between top and second-best correlation
+specificity = top_1_val - tmp.max(axis=1)
 
-# 2. Calculate Specificity Score
-specificity = top_1_val - top_2_val
 
-# 3. Create the Quantification Table
-quant_df = pd.DataFrame({
+#Summarize results in a DataFrame
+celltypist_summary = pd.DataFrame({
     'Factor': eval_matrix.index,
     'Top_CellType': top_1.values,
     'Correlation': top_1_val.values,
-    'Specificity': specificity.values
-}).sort_values('Correlation', ascending=False)
+    'Specificity': specificity.values,
+})
 
-# 4. Filter for "Identified" factors (Correlation > 0.4)
-identified_factors = quant_df[quant_df['Correlation'] > 0.4]
+celltypist_summary['Tool'] = 'celltypist'
+celltypist_summary['Label_std'] = celltypist_summary['Top_CellType'].astype(str).str.lower().str.replace(r'[^a-z0-9]+', '_', regex=True).str.strip('_')
+celltypist_summary['Significant'] = (
+    (celltypist_summary['Correlation'] >= corr_threshold)
+    & (celltypist_summary['Specificity'] >= spec_threshold)
+)
+display(celltypist_summary[celltypist_summary['Significant']].head(20))
 
-print(f"Quantification Summary:")
-print(f"- Total Factors evaluated: {len(quant_df)}")
-print(f"- Successfully assigned (Corr > 0.4): {len(identified_factors)}")
-print(f"- Highly Specific (> 0.2 Gap): {len(quant_df[quant_df['Specificity'] > 0.2])}")
-
-quant_df.head(10)
 
 # %% [markdown]
-# ### 2. Gene Set Enrichment Analysis (Functional Identity)
+# ## 2. Gene Set Enrichment Analysis (Functional Identity)
 
 # %% [markdown]
 # Goal: Identify biological processes (e.g., "Interferon Response", "Cell Cycle") for factors that do not map 1-to-1 to a cell type.
@@ -439,7 +464,7 @@ quant_df.head(10)
 # Key Metrics:
 
 # %% [markdown]
-# #### 2.1 Blitzqseq
+# ### 2.1 Blitzqseq
 
 # %% [markdown]
 # How it works:
@@ -459,130 +484,139 @@ quant_df.head(10)
 #     * Leading Edge Genes: The specific subset of genes within a pathway that actually drove the enrichment score
 
 # %% [markdown]
-# ##### Import
+# #### BlitzGSEA Library
 
 # %%
-import blitzgsea as blitz 
-import pandas as pd
-
-
-# %%
-# 1. load data base (MSigDB Hallmark is the gold standard for the first evaluation)
+# MSigDB Hallmark is the gold standard for the first evaluation
 signature_lib = blitz.enrichr.get_library("MSigDB_Hallmark_2020")
 
-# 2. Extract reconstruction effects 
-# This matrix shows: Gene x Factor
+# %% [markdown]
+# #### BlitzGSEA Scores (from latent dimensions)
 
-recon_effects = model.get_max_effect_of_splits_within_distribution(adata=adata)
-recon_effects_t = recon_effects.T
+# %%
+# Use full rankings, both directions
+pos_df = traverse_adata.varm["max_possible_traverse_effect_pos"].copy()
+neg_df = traverse_adata.varm["max_possible_traverse_effect_neg"].copy()
+pos_df.columns = pos_df.columns.astype(str)
+neg_df.columns = neg_df.columns.astype(str)
 
-# covert into data frame for easier handling
-# index=2000 genes, columns=128 factors
-scores_df = pd.DataFrame(
-    recon_effects_t,
-    index=adata.var_names,
-    columns=embed.var['title']
+#Name mapping from factor IDs to titles (e.g. "DR 36")
+dimid_to_title = (
+    embed.var[["original_dim_id", factor_id_col]]
+    .assign(original_dim_id=lambda d: d["original_dim_id"].astype(str),
+            factor_id=lambda d: d[factor_id_col].astype(str))
+    .drop_duplicates("original_dim_id")
+    .set_index("original_dim_id")["factor_id"]
+    .to_dict()
 )
+# only keep factors that are in both pos and neg and have a title
+raw_ids = [rid for rid in pos_df.columns if rid in neg_df.columns and rid in dimid_to_title] 
 
-#Ensure that only active factors are included in the GSEA
-if 'vanished' in embed.var:
-    active_factors = embed.var[embed.var['vanished'] == False]['title']
-    scores_df = scores_df[active_factors]
+# Combine pos and neg scores, and rename columns to include direction and factor titles
+scores_df = pd.concat([pos_df[raw_ids].add_suffix("+"), neg_df[raw_ids].add_suffix("-")], axis=1)
+scores_df.columns = [f"{dimid_to_title[c[:-1]]}{c[-1]}" for c in scores_df.columns if c[:-1] in dimid_to_title]
+print(f"GSEA inputs: {scores_df.shape[1]} factor-directions")
 
-print(f"Input ready: {scores_df.shape[1]} active factors ready for annotation.")
-
+print(f"GSEA inputs from DRVI framework: {len(gsea_inputs)} factor-directions")
 
 # %% [markdown]
 # ##### GSEA
 
 # %%
-gsea_results = []
-gsea_results = []
-for factor in scores_df.columns:
-    # 1. Extract the factor as a Series
-    sig_series = scores_df[factor]
-    
-    # 2. Important: transform in DataFrame and rename columns for blitzgsea
-    # 'i' = gene-name (index), 'v' = value (effect)
-    signature = sig_series.reset_index()
-    signature.columns = ['i', 'v']
-    
-    # 3. GSEA calculation (blitzgsea sorts internally)
+blitzgsea_results = [] # to store results
+for factor_dir in scores_df.columns:
     try:
-        res = blitz.gsea(signature, signature_lib)
-        
-        # filter significant results 
-        top = res[res['fdr'] < 0.05].sort_values('nes', ascending=False)
-        
-        if not top.empty:
-            gsea_results.append({
-                'Factor': factor,
-                'Term': top.iloc[0].name,
-                'NES': top.iloc[0]['nes'],
-                'FDR': top.iloc[0]['fdr']
+        signature = scores_df[factor_dir].rename("v").reset_index().rename(columns={"index": "i"}) # blitzgsea expects columns "i" and "v"
+        signature["v"] = pd.to_numeric(signature["v"], errors="coerce") # ensure numeric and coerce errors to NaN
+        signature = signature.replace([np.inf, -np.inf], np.nan).dropna(subset=["v"])
+        res = blitz.gsea(signature, signature_lib, processes=4) # run GSEA with parallelization
+        sig = res[res["fdr"] < gsea_fdr_threshold].sort_values("fdr") # filter significant results and sort by FDR
+        if len(sig): # if there are significant results, take the top one, else record as no significant enrichment
+            blitzgsea_results.append({
+                "FactorDir": factor_dir,
+                "Factor": factor_dir[:-1],
+                "Direction": factor_dir[-1],
+                "Term": sig.index[0],
+                "NES": float(sig.iloc[0]["nes"]),
+                "FDR": float(sig.iloc[0]["fdr"]),
             })
         else:
-            gsea_results.append({
-                'Factor': factor,
-                'Term': 'No significant enrichment',
-                'NES': 0,
-                'FDR': 1
-            })
-    except Exception as e:
-        print(f"Fehler bei Faktor {factor}: {e}")
+            blitzgsea_results.append({"FactorDir": factor_dir, "Factor": factor_dir[:-1], "Direction": factor_dir[-1], "Term": "No significant enrichment", "NES": 0.0, "FDR": 1.0})
+    except Exception as e: # if any error occurs (e.g. due to bad input), record it and continue with the next factor
+        blitzgsea_results.append({"FactorDir": factor_dir, "Factor": factor_dir[:-1], "Direction": factor_dir[-1], "Term": f"ERROR: {type(e).__name__}", "NES": 0.0, "FDR": 1.0})
 
-# Summary
-gsea_summary = pd.DataFrame(gsea_results)
+blitzgsea_summary = pd.DataFrame(blitzgsea_results) 
+display(blitzgsea_summary.head(60))
+
 
 # %% [markdown]
-# ##### Evaluation of tool
+# #### BlitzGSEA Summary
 
 # %%
-gsea_summary = pd.DataFrame(gsea_results)
+# Create a summary of significant GSEA results
+annotated = blitzgsea_summary[blitzgsea_summary["FDR"] < gsea_fdr_threshold].copy()
 
-total_factors = len(gsea_summary)
-annotated_factors = len(gsea_summary[gsea_summary['Term'] != 'No significant enrichment'])
-coverage = (annotated_factors / total_factors) * 100
+#Calculate key performance indicators
 
-print(f"--- Evaluation Summary for BlitzGSEA ---")
-print(f"Annotation Coverage: {coverage:.2f}%")
-print(f"Identified: {annotated_factors} / {total_factors} Factors.")
+# how many percent of latent factors got at least one significant annotation?
+coverage = 100 * len(annotated) / len(blitzgsea_summary) if len(blitzgsea_summary) else 0 
+print(f"Coverage (FDR<{gsea_fdr_threshold}): {coverage:.2f}% ({len(annotated)}/{len(blitzgsea_summary)})")
 
-# Visualize
-# Only show factors with significant annotation and sort by NES
-plot_df = gsea_summary[gsea_summary['Term'] != 'No significant enrichment'].head(15)
+# how many unique terms were found? This indicates the diversity of biological processes captured by the factors.
+print(f"Unique terms: {annotated['Term'].nunique()}")
 
-if not plot_df.empty:
-    plt.figure(figsize=(10, 6))
-    sns.barplot(data=plot_df, x='NES', y='Term', hue='Factor', palette='hls', dodge=False)
-    plt.title("Top Biological Annotations per Factor (BlitzGSEA)")
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.show()
+# Normalized Enrichment Score. A value above 2 is generally considered strong evidence of enrichment. The median NES gives a sense of the overall strength of the annotations.
+print(f"Median NES: {annotated['NES'].median():.2f}" if len(annotated) else "Median NES: n/a")
+
+
+# %% [markdown]
+# #### Preparation Cross Tool Comparison
 
 # %%
-# 1.Calculate Metrics
-total_factors = len(scores_df.columns)
-annotated = gsea_summary[gsea_summary['Term'] != 'No significant enrichment']
-coverage = (len(annotated) / total_factors) * 100
+blitzgsea_tool_summary = blitzgsea_summary.copy()
+blitzgsea_tool_summary["Tool"] = "blitzgsea"
+blitzgsea_tool_summary["Label"] = blitzgsea_tool_summary["Term"].astype(str)
+blitzgsea_tool_summary["Label_std"] = blitzgsea_tool_summary["Label"].str.lower().str.replace(r"[^a-z0-9]+", "_", regex=True).str.strip("_")
+blitzgsea_tool_summary["Significant"] = blitzgsea_tool_summary["FDR"] < gsea_fdr_threshold
 
-# Specificity: How many terms are unique?
-unique_terms = annotated['Term'].nunique()
-specificity_ratio = (unique_terms / len(annotated)) * 100 if len(annotated) > 0 else 0
+display(annotated.sort_values("NES", ascending=False).head(20))
 
-# Singal Strength: Median NES of annotated factors
-median_nes = annotated['NES'].median()
+# %% [markdown]
+# #### Cross Tool Comparison
 
-# 2. Summary Report
-print(f"--- BlitzGSEA Evaluation Report ---")
-print(f"1. Coverage: {coverage:.2f}% ({len(annotated)} von {total_factors} Faktoren)")
-print(f"2. Spezifität: {specificity_ratio:.2f}% ({unique_terms} einzigartige Begriffe)")
-print(f"3. Signalstärke (Median NES): {median_nes:.2f}")
-print(f"-----------------------------------")
+# %%
+# Preparation of Cell-Typist Data for Comparison
+ct_sig = celltypist_summary[celltypist_summary['Significant']][['Factor', 'Label_std', 'Correlation', 'Specificity']]
+ct_sig = ct_sig.rename(columns={'Label_std': 'CellTypist_Label'})
 
-# 3. Top-Faktoren nach Signalstärke anzeigen
-print("Top 5 annotierte Faktoren:")
-print(annotated.sort_values('NES', ascending=False).head(20))
+#Filter significant GSEA results
+gs_sig = (
+    blitzgsea_tool_summary[blitzgsea_tool_summary['Significant']]
+    .sort_values(['FDR', 'NES'], ascending=[True, False])
+    .drop_duplicates('Factor')
+    [['Factor', 'Direction', 'Label_std', 'NES', 'FDR']]
+    .rename(columns={'Label_std': 'BlitzGSEA_Label'})
+)
+
+# Merge CellTypist and BlitzGSEA results on Factor
+comparison = ct_sig.merge(gs_sig, on='Factor', how='outer')
+comparison['Relationship'] = np.where(
+    comparison['CellTypist_Label'].isna(),
+    'blitzgsea_only', # if CellTypist label is missing but GSEA gives a result it's a BlitzGSEA-only annotation
+    np.where(
+        comparison['BlitzGSEA_Label'].isna(),
+        'celltypist_only', #factor is a cell type
+        np.where(comparison['CellTypist_Label'] == comparison['BlitzGSEA_Label'], 'same_label', 'complementary') #both tools give an annotation, if they match it's "same_label", else it's "complementary"
+    )
+)
+
+print("Cross-tool relationship counts:")
+display(comparison['Relationship'].value_counts()) 
+display(comparison.sort_values(['Relationship', 'Factor']).head(50))
+
+
+# %% [markdown]
+# #### 2.2 Gseapy
 
 # %% [markdown]
 # ### 3. Language Model Based Identification (Advanced Annotation)
