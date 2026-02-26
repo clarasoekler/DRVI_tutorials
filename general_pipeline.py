@@ -82,7 +82,7 @@ plt.rcParams["figure.figsize"] = (3, 3)
 
 # +
 # Set this to false if you already trained your model and do not want to retrain.
-overwrite = True
+overwrite = False
 SEED = 1  # Set to None if you don't want to set seed
 
 # Set input output directory to load data from and store model and embeddings there
