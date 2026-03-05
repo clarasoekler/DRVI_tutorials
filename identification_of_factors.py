@@ -274,7 +274,12 @@ drvi.utils.pl.plot_latent_dims_in_heatmap(embed, "final_annotation", title_col="
 # ### Shared Imports
 
 # %%
+import json
+import hashlib
 import re
+from collections import Counter
+from pathlib import Path
+from scipy.spatial.distance import cosine as cosine_dist
 
 import blitzgsea as blitz
 import celltypist
@@ -299,37 +304,67 @@ TOP_N = 300 # Number of top-ranked genes per factor used as input for ORA tools 
 FDR = 0.05 # False Discovery Rate threshold for significance across all tools
 
 # %%
+# ---------------------------------------------------------------------------
 # CellTypist
+# ---------------------------------------------------------------------------
 CT_CORR_THRESHOLD = 0.40 # Minimum Pearson correlation between factor and cell-type probability
 CT_SPEC_THRESHOLD = 0.10 # Minimum specificity (gap between best and second-best correlation)
 
+# ---------------------------------------------------------------------------
 # GSEA tools (blitzgsea / gseapy)
-GSEA_DB = "MSigDB_Hallmark_2020"
+# ---------------------------------------------------------------------------
+GSEA_DB = "MSigDB_C7"  # Any gseapy-compatible library name, e.g. "MSigDB_Hallmark_2020", "GO_Biological_Process_2023", "Azimuth_Cell_Types_2021"
 GSEAPY_MIN_SIZE = 10
 GSEAPY_MAX_SIZE = 500
 GSEAPY_PERMUTATIONS = 1000
 BLITZGSEA_PROCESSES = 4
 
+# ---------------------------------------------------------------------------
 # g:Profiler
+# ---------------------------------------------------------------------------
 GP_ORGANISM = "hsapiens"
-GP_SOURCES = None
+GP_SOURCES = [None]  # Any list of g:Profiler sources, e.g. ["GO:BP", "REAC", "MSigDB_Hallmark_2020"]. Set to None to use all sources.
 GP_USER_THRESHOLD = 0.05
 GP_ORDERED = False
 
+# ---------------------------------------------------------------------------
 # decoupler
-DC_ORGANISM = "human"  # "human" or "mouse"
-DC_GENESET = "msdib_hallmark"
+# ---------------------------------------------------------------------------
+DC_ORGANISM = "human"
+DC_GENESET = "msigb_c7_celltype"  # Any OmniPath resource name, e.g. "PanglaoDB", "CellTypist". Set to None if using custom network.
 DC_METHODS = ["ulm", "mlm", "zscore"]
 DC_USE_CONSENSUS = True
 DC_PRIMARY_METHOD = "ulm"
 DC_TMIN = 5
 
+# ---------------------------------------------------------------------------
 # Input harmonization
+# ---------------------------------------------------------------------------
 USE_EMBED_FACTOR_NAMES = True
-FACTOR_NAME_COL = "title"  # fallback to "original_dim_id" if missing
+FACTOR_NAME_COL = "title"
+
+# ---------------------------------------------------------------------------
+# Tool registry  (toggle tools on/off for experiment runs)
+# ---------------------------------------------------------------------------
+CELLTYPE_TOOLS = ["atlas", "celltypist"]
+BIOPROC_TOOLS  = ["blitzgsea", "gseapy", "gprofiler", "decoupler"]
 
 
-
+# Libraries to run: edit this list manually (add/remove rows). Optional keys: min_size, max_size, domain, category.
+# DB_CONFIGS remains available for backward compatibility.
+# ---------------------------------------------------------------------------
+LIBRARIES = [
+    {"db_name": "MSigDB_Hallmark_2020",       "tool": "blitzgsea", "domain": "BioProc", "min_size": 10, "max_size": 500},
+    {"db_name": "MSigDB_Hallmark_2020",       "tool": "gseapy",    "domain": "BioProc", "min_size": 10, "max_size": 500},
+    {"db_name": "GO_Biological_Process_2023", "tool": "gseapy",   "domain": "BioProc", "min_size": 10, "max_size": 500},
+    {"db_name": "Reactome_2022",              "tool": "gseapy",   "domain": "BioProc", "min_size": 10, "max_size": 500},
+    {"db_name": "KEGG_2021_Human",            "tool": "gseapy", "domain": "BioProc", "min_size": 10, "max_size": 500},
+    {"db_name": "Azimuth_Cell_Types_2021",     "tool": "gseapy",   "domain": "CellType", "min_size": 5, "max_size": 500},
+    {"db_name": "PanglaoDB_Augmented_2021",    "tool": "gseapy",   "domain": "CellType", "min_size": 5, "max_size": 500},
+    {"db_name": "CellMarker_Augmented_2021",   "tool": "gseapy",   "domain": "CellType", "min_size": 5, "max_size": 500},
+    {"db_name": "Tabula_Sapiens",              "tool": "gseapy",   "domain": "CellType", "min_size": 5, "max_size": 500},
+]
+DB_CONFIGS = pd.DataFrame(LIBRARIES)
 
 # %% [markdown]
 # ### Data Preparation
@@ -349,7 +384,6 @@ if GENE_CASE == "upper":
 
 ALL_GENES = pd.Index(ALL_GENES).drop_duplicates().tolist()
 print(f"ALL_GENES: {len(ALL_GENES)} genes")
-
 
 
 
@@ -392,67 +426,77 @@ if pos_df.shape[1] == len(mask):
 pos_df.columns = factor_ids
 neg_df.columns = factor_ids
 
-
 # %% [markdown]
 # #### Helper functions
 
 # %%
-#Similarity between factors and annotations based on SMI-disc metric from the DiscreteDisentanglementBenchmark
+# Map each factor to its top annotation label and SMI score (from smi_similarity).
+# This is merged into each tool's results table to show the known cell-type context.
 x = smi_similarity.apply(pd.to_numeric, errors="coerce")
 x.index = x.index.astype(str)
 
-# Build a mapping of each factor to its best-matching annotation and the corresponding SMI score
 annot_map = pd.DataFrame({
     "Factor": x.index,
     "Annot_Label": x.idxmax(axis=1).astype(str).values,
-    "Annot_SMI": x.max(axis=1).values,
+    "Annot_SMI": x.max(axis=1).round(3).values,
 })
 annot_map.head()
-
 
 # %% [markdown]
 # ### Shared Preprocessing
 
 # %%
-#Normalize gene symbols and resolve duplicates
-def standardize_scores_df(df: pd.DataFrame, gene_case: str = "upper") -> pd.DataFrame:
-    """"
-    Input:  DataFrame with gene symbols as index, factors as columns.
-    Output: DataFrame with cleaned index (uppercased if gene_case="upper"),
-            duplicate genes merged by taking the max score per factor.
-    """
-    out = df.copy()
-    out.index = out.index.astype(str).str.strip()
-    if gene_case == "upper":
-        out.index = out.index.str.upper()
-    out = out.groupby(out.index).max()
-    return out
-
 # Prepare ranked gene lists and top-N gene sets for enrichment analysis
+# Input:  genes x factors score matrix, number of top genes, case normalization.
+# Output: (std, ranked, top) where
+        # - std:    standardized scores DataFrame (genes x factors)
+        # - ranked: dict of all genes sorted by descending score per factor (input for GSEA-style tools: BlitzGSEA, GSEApy)
+        # - top:    dict of top_n gene symbols per factor (input for ORA-style tools: g:Profiler)
+
+#Normalize gene symbols and resolve duplicates
+# Input:  DataFrame with gene symbols as index, factors as columns.
+# Output: DataFrame with cleaned index (uppercased if gene_case="upper"), duplicate genes merged by taking the max score per factor.
+
+
 def build_inputs(df, top_n, gene_case="upper", all_genes=ALL_GENES):
-    """""
-    Input:  genes x factors score matrix, number of top genes, case normalization.
-    Output: (std, ranked, top) where
-        - std:    standardized scores DataFrame (genes x factors)
-        - ranked: dict of all genes sorted by descending score per factor
-                  (input for GSEA-style tools: BlitzGSEA, GSEApy)
-        - top:    dict of top_n gene symbols per factor
-                  (input for ORA-style tools: g:Profiler)
+    """Standardize gene symbols and build enrichment inputs from a genes × factors score matrix.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Raw genes × factors score matrix (e.g. pos_df / neg_df from traverse analysis).
+    top_n : int
+        Number of top-ranked genes to include in the ORA (g:Profiler) query set.
+    gene_case : str
+        "upper" to uppercase gene symbols for cross-database matching.
+    all_genes : list
+        Background gene universe; rows are reindexed to this set (missing → NaN).
+
+    Returns
+    -------
+    std : DataFrame
+        Standardized genes × factors scores (duplicates merged by max).
+    ranked : dict
+        {factor: Series of all genes sorted by descending score} – input for GSEA tools.
+    top : dict
+        {factor: list of top_n gene symbols} – input for ORA tools (g:Profiler).
     """
     std = df.copy()
     std.index = std.index.astype(str).str.strip()
     if gene_case == "upper":
         std.index = std.index.str.upper()
-    std = std.groupby(std.index).max()  # summarize duplicate genes
+    # Duplicate gene symbols are collapsed by taking the max score per factor.
+    std = std.groupby(std.index).max()
 
     if all_genes is not None:
         idx = pd.Index(pd.Series(all_genes).astype(str)).drop_duplicates()
-        # missing genes will be filled with NaN, no artificial filling with 0.0
+        # Reindex to the background universe; genes absent from df become NaN
+        # (not zero, to avoid inflating GSEA null distributions).
         std = std.reindex(idx)
 
-    # only consider genes with real scores for ranking
+    # Only genes with real scores are included in ranked lists.
     ranked = {c: std[c].dropna().sort_values(ascending=False) for c in std.columns}
-    top = {c: ranked[c].head(top_n).index.tolist() for c in std.columns}
+    top    = {c: ranked[c].head(top_n).index.tolist()          for c in std.columns}
     return std, ranked, top
 
 
@@ -467,15 +511,17 @@ factor_ids = list(pos_std.columns)
 
 print(f"Factors: {len(factor_ids)}")
 
-# %%
-# print summary of inputs for enrichment analysis
+ # %%
+ # Summarise background gene count and enrichment input shapes for a quick sanity check.
 print(f"ALL_GENES (background): {len(ALL_GENES)}")
 
-ranked_inputs = {}
-for fac in factor_ids:
-    ranked_inputs[f"{fac}_pos"] = pos_ranked[fac]
-    ranked_inputs[f"{fac}_neg"] = neg_ranked[fac]
-print(f"Ranked inputs: {len(ranked_inputs)}")
+# Build combined ranked-input dict: "{factor}_pos" / "{factor}_neg" → ranked Series
+ranked_inputs = {
+    f"{fac}_{direction}": series
+    for fac in factor_ids
+    for direction, series in [("pos", pos_ranked[fac]), ("neg", neg_ranked[fac])]
+ }
+print(f"Ranked inputs (factor × direction): {len(ranked_inputs)}")
 
 k = next(iter(pos_top))
 print(f"[g:Profiler] query genes (Top-N, pos) for {k}: {len(pos_top[k])}")
@@ -486,99 +532,103 @@ print(f"[decoupler] matrix shape (pos): {mat.shape}  # (factors, genes)")
 
 
 # %% [markdown]
-# ### Helper Function SMI Score
+# ### Helper Function Summary
 
 # %%
 # Helper: strip FactorDir to base factor (e.g. "DR 36_pos" -> "DR 36")
 def strip_factor(x):
-    """Strip direction suffixes (_pos/_neg/+/-) from factor names."""
+    """Strip direction suffixes (_pos/_neg/+/-) from factor names to get the base factor ID."""
     return (pd.Series(x).astype(str)
             .str.replace(r"_(pos|neg)$", "", regex=True)
-            .str.replace(r"([+-])$", "", regex=True))
+            .str.replace(r"([+-])$",     "", regex=True))
 
-# SMI (discrete mutual information) between factor and tool-specific term.
-# Returns per-factor SMI as a Series (index = factor), and total MI.
-def compute_smi_discrete(factor_series, term_series):
-    print(factor_series, term_series)
-    from sklearn.metrics import mutual_info_score
-    f = pd.Series(factor_series).astype(str).values
-    t = pd.Series(term_series).astype(str).values
-    factors, f_inv = pd.factorize(f)
-    terms, t_inv = pd.factorize(t)
-    n = len(factors)
-    if n == 0:
-        return pd.Series(dtype=float), 0.0
-    joint = np.zeros((len(f_inv), len(t_inv)))
-    for i in range(n):
-        joint[factors[i], terms[i]] += 1
-    joint = joint / joint.sum()
-    p_f = joint.sum(axis=1)
-    p_t = joint.sum(axis=0)
-    mi_total = mutual_info_score(factors, terms)
-    eps = 1e-12
-    per_f = np.zeros(len(f_inv))
-    for i in range(len(f_inv)):
-        for j in range(len(t_inv)):
-            if joint[i, j] > 0:
-                per_f[i] += joint[i, j] * (np.log2(joint[i, j] + eps) - np.log2(p_f[i] * p_t[j] + eps))
-    return pd.Series(per_f, index=f_inv), mi_total
+def _pick_col(df: pd.DataFrame, candidates):
+    """Return the first column name from *candidates* that exists in *df*.
 
-# Build tool result table with per-factor SMI (tool-specific: factor vs. term).
-def build_tool_smi_table(sig_df, factor_col, term_col, score_col, tool_name, ascending=True):
-    if sig_df.empty:
-        return sig_df.assign(SMI=np.nan, Tool=tool_name)
-    factor_clean = strip_factor(sig_df[factor_col]) if factor_col == "FactorDir" else sig_df[factor_col].astype(str)
-    term_vals = sig_df[term_col].astype(str)
-    per_factor_smi, _ = compute_smi_discrete(factor_clean, term_vals)
-    factor_key = factor_clean.values
-    smi_col = np.array([per_factor_smi.get(f, np.nan) for f in factor_key])
-    out = sig_df.copy()
-    out["Factor"] = factor_key
-    out["SMI"] = smi_col
-    out["Tool"] = tool_name
-    return out
+    Handles varying column naming conventions across blitzgsea / gseapy versions
+    (e.g. "Term" vs "term", "FDR" vs "fdr", "NES" vs "nes").
+    """
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
-# Build SMI table, merge with annot_map, and display results for a tool
-def build_smi_and_display(sig_df, factor_col, term_col, score_col, tool_name, ascending=True):
-    smi_table = build_tool_smi_table(sig_df, factor_col, term_col, score_col, tool_name, ascending=ascending)
-    smi_table = smi_table.reset_index(drop=True).merge(annot_map, on="Factor", how="left")
-    print(f"{tool_name} — all significant results with per-factor SMI:")
-    display(smi_table.sort_values(["SMI", score_col], ascending=[False, ascending]))
-    return smi_table
+def _enrich_sig(sig_df, full_df, factor_col, score_col, use_nes=False):
+    """Attach per-factor specificity and annotation-map context to a significance table.
 
+    Parameters
+    ----------
+    sig_df   : pre-filtered DataFrame already containing a "Factor" column.
+    full_df  : the full (unfiltered) results DataFrame used to compute specificity.
+    factor_col : column in *full_df* that holds factor/direction labels.
+    score_col  : column used as effect size for specificity (NES or p-value).
+    use_nes    : if True, uses |NES| as effect size; otherwise uses -log10(p-value).
 
-# Print coverage, unique terms, and median effect size for a tool
+    Returns the merged DataFrame (sig_df + Specificity + Annot_Label + Annot_SMI).
+    """
+    spec = compute_tool_specificity(full_df, factor_col, score_col, use_nes=use_nes)
+    return (sig_df
+            .merge(annot_map, on="Factor", how="left")
+            .merge(spec, left_on="Factor", right_index=True, how="left"))
+
 def tool_coverage_summary(results_df, sig_df, factor_col, term_col, pval_col, tool_name, effect_type="pval"):
+    """Print coverage, unique term count, and median effect size for one tool."""
     all_factors = strip_factor(results_df[factor_col]) if not results_df.empty else pd.Series(dtype=str)
-    hit_factors = strip_factor(sig_df[factor_col]) if not sig_df.empty else pd.Series(dtype=str)
+    hit_factors = strip_factor(sig_df[factor_col])     if not sig_df.empty     else pd.Series(dtype=str)
 
-    n_total = all_factors.nunique()
-    n_hit = hit_factors.nunique()
+    n_total  = all_factors.nunique()
+    n_hit    = hit_factors.nunique()
     coverage = 100 * n_hit / n_total if n_total else 0
-
-    n_terms = sig_df[term_col].nunique() if not sig_df.empty else 0
+    n_terms  = sig_df[term_col].nunique() if not sig_df.empty else 0
 
     if effect_type == "nes":
-        median_val = sig_df["NES"].median() if not sig_df.empty else float("nan")
+        median_val   = sig_df["NES"].median() if not sig_df.empty else float("nan")
         effect_label = "Median NES"
-        effect_str = f"{median_val:.2f}"
+        effect_str   = f"{median_val:.2f}"
     else:
-        median_val = (-np.log10(sig_df[pval_col])).median() if not sig_df.empty else float("nan")
+        median_val   = (-np.log10(sig_df[pval_col])).median() if not sig_df.empty else float("nan")
         effect_label = "Median -log10(p)"
-        effect_str = f"{median_val:.2f}"
+        effect_str   = f"{median_val:.2f}"
 
-    print(f"{tool_name} coverage (FDR<{FDR}): {coverage:.2f}% ({n_hit}/{n_total})") ## how many percent of latent factors got at least one significant annotation? We ignore the direction (_pos/_neg) when calculating coverage, as they represent the same underlying factor.
-    print(f"Unique terms: {n_terms}") ## how many unique terms were found? This indicates the diversity of biological processes captured by the factors.
-    print(f"{effect_label}: {effect_str}") ## how strong are the effects? For ORA tools we use median -log10(p), for GSEA tools we use median NES. Higher values indicate stronger associations between factors and annotations.
+    # Coverage: fraction of latent factors with at least one significant annotation.
+    # Direction (_pos/_neg) is ignored when counting factors so each latent dimension
+    # is counted once regardless of which direction was significant.
+    print(f"{tool_name} coverage (FDR<{FDR}): {coverage:.2f}% ({n_hit}/{n_total})")
+    # Unique terms indicate diversity of captured biological programs.
+    print(f"Unique terms: {n_terms}")
+    # Effect size: median NES for GSEA tools, median -log10(p) for ORA/footprint tools.
+    print(f"{effect_label}: {effect_str}")
+
+#Per-factor specificity: gap between best and second-best term.
+# Analogous to CellTypist's SMI(best) - SMI(second-best).
+#For GSEA tools (use_nes=True): uses |NES| as effect size.
+# For ORA/footprint tools: uses -log10(p-value)
+def compute_tool_specificity(df, factor_col, score_col, use_nes=False):
+    """Per-factor specificity: gap between best and second-best term score.
+
+    Analogous to CellTypist's SMI(best) - SMI(second-best).
+    For GSEA tools (use_nes=True) uses |NES|; for ORA/footprint tools uses -log10(p).
+    """
+    tmp = df.copy()
+    tmp["_factor"] = strip_factor(tmp[factor_col]).values
+    tmp["_score"]  = tmp[score_col].abs() if use_nes else -np.log10(tmp[score_col].clip(lower=1e-300))
+
+    def _gap(g):
+        top2   = g.nlargest(2)
+        best   = top2.iloc[0] if len(top2) > 0 else 0.0
+        second = top2.iloc[1] if len(top2) > 1 else 0.0
+        return best - second
+
+    return tmp.groupby("_factor")["_score"].apply(_gap).rename("Specificity")
 
 
 
 
 # %% [markdown]
-# ## 1. Statistical Annotation & Similarity 
+# ## 1. Cell Type Annotation
 
 # %% [markdown]
-# Goal: Map latent factors to known cell types using existing annotations and atlases.
+# Goal: Map latent factors to known cell types
 #
 # Tools to Compare:
 # * CellTypist: Utilizing the Immune_All_Low.pkl or High models for automated labeling.
@@ -589,8 +639,14 @@ def tool_coverage_summary(results_df, sig_df, factor_col, term_col, pval_col, to
 #     * Descartes_Cell_Types_and_Tissue_2021 (Human Cell Atlas) --> broad level annotation
 #     * Tabula Sapiens (one of the biggest Single Cell Atlases, 24 Organs)
 #     * ...
-#
-#
+# * LLM/foundation model frameworks:
+#     * No requirement of Anthropic/OpenAI/Gemini API keys or can use free resources:
+#         * mLLM Celltype: uses GPT-5/Claude3.7/DeepSeek-R1 through agentic discussion
+#              * also explains the why
+#         * DeepCellSeek:????
+#     * Require API keys:
+#         * GPTCellType: a bit outdated
+#         * Cell Agent: multi-agent system that actively looks into data bases such as CellxGene, PanglaoDB to avoid hallucinations
 #
 #
 # Key Metrics:
@@ -619,13 +675,13 @@ def tool_coverage_summary(results_df, sig_df, factor_col, term_col, pval_col, to
 
 # %%
 #download celltypist model
-print(models.models_description())
+#print(models.models_description())
 model_name = 'Immune_All_Low.pkl'
 models.download_models(force_update=True, model=model_name)
 
 #load recommended model for immune cells
 ct_model = models.Model.load(model=model_name)
-print(ct_model.cell_types)
+#print(ct_model.cell_types)
 
 # %% [markdown]
 # #### CellTypist Annotation
@@ -678,19 +734,13 @@ smi_long = smi_long.sort_values("SMI", ascending=False).reset_index(drop=True)
 
 
 
-# %%
-celltypist_summary = smi_long.rename(columns={"title": "Factor", "Label": "Top_CellType", "SMI": "Correlation"})
-celltypist_summary["Specificity"] = np.nan
+  # %%
+  # Sort factors by numeric index (e.g. "DR 36" → 36) for a readable y-axis ordering.
+def _factor_sort_key(name):
+    n = str(name).replace("DR", "").strip()
+    return int(n) if n.isdigit() else float("inf")
 
-# %%
-#Visualize with heatmap
-smi_sorted = smi.copy()
-smi_sorted = smi_sorted.loc[
-    sorted(
-        smi_sorted.index,
-        key=lambda x: int(str(x).replace("DR", "").strip()) if str(x).replace("DR", "").strip().isdigit() else 10**9
-    )
-]
+smi_sorted = smi.loc[sorted(smi.index, key=_factor_sort_key)]
 
 plt.figure(figsize=(20, 14))
 ax = sns.heatmap(smi_sorted, cmap="RdBu_r", center=0)
@@ -738,50 +788,134 @@ sc.pl.violin(
 # #### CellTypist Summary
 
 # %%
-# Compute specificity: how uniquely a factor maps to its top cell type.
-# Specificity = SMI(best) - SMI(second-best).
-# High specificity means the factor is specific to one cell type;
-# low specificity suggests the factor captures variation shared across types.
-top_1 = smi.idxmax(axis=1)
-top_1_val = smi.max(axis=1)
+# Low specificity  → factor captures variation shared across multiple types.
 
-tmp = smi.copy()
-for i, c in enumerate(top_1):
-    tmp.iloc[i, tmp.columns.get_loc(c)] = -1
-
-specificity = top_1_val - tmp.max(axis=1)
+# Vectorised: sort each row descending and take the top-2 values at once.
+vals      = np.sort(smi.values, axis=1)[:, ::-1]   # shape: (n_factors, n_celltypes)
+top_1     = smi.idxmax(axis=1)                       # best cell-type label per factor
+top_1_val = pd.Series(vals[:, 0], index=smi.index)  # best SMI score
+specificity = pd.Series(vals[:, 0] - vals[:, 1], index=smi.index)  # gap to second-best
 
 celltypist_summary = pd.DataFrame({
-    "Factor": smi.index,
+    "Factor":       smi.index,
     "Top_CellType": top_1.values,
-    "SMI-value": top_1_val.values,   # hier: SMI-Score
-    "Specificity": specificity.values,
+    "SMI-value":    top_1_val.values,
+    "Specificity":  specificity.values,
 })
-
-celltypist_summary["Tool"] = "SMI"
+celltypist_summary["Tool"]      = "SMI"
 celltypist_summary["Label_std"] = (
     celltypist_summary["Top_CellType"].astype(str)
     .str.lower().str.replace(r"[^a-z0-9]+", "_", regex=True).str.strip("_")
 )
 celltypist_summary["Significant"] = (
-    (celltypist_summary["SMI-value"] >= CT_CORR_THRESHOLD)
+    (celltypist_summary["SMI-value"]   >= CT_CORR_THRESHOLD)
     & (celltypist_summary["Specificity"] >= CT_SPEC_THRESHOLD)
 )
 
-display(celltypist_summary[celltypist_summary["Significant"]].head(20))
+display(celltypist_summary[celltypist_summary["Significant"]])
 
 
 # %% [markdown]
-# ## 2. Gene Set Enrichment Analysis (Functional Identity)
+# ### 1.2 GPTCellType
+
+# %% [markdown]
+# How it works: REQUIRES API KEYS
+#
+# * Input: Top-ranked marker genes (e.g., top 10–50 genes from DRVI factor loadings) and basic metadata (tissue type and species)
+# * Reference: 
+#     * Internal LLM Knowledge: Relies entirely on the pre-trained generative parameters of a single Large Language Model (typically GPT-4 or GPT-4o)
+#     * Textual Priors: Uses the massive corpus of biomedical literature, textbooks, and database descriptions seen during the model's training phase
+# * Algorithm: 
+#     * Direct Prompting: The gene list is formatted into a specialized prompt (e.g., "Assign a cell type or biological process to these genes...")
+#     * Zero-Shot Heuristics: The model performs a semantic match between the input gene symbols and its internal "memory" of gene functions
+#     * Single-Pass Logic: Unlike agent-based models, it makes a one-shot decision based on the probability of the next tokens in the sequence
+# * Output: 
+#     * Identity Label: A concise name for the cell type or biological program (factor)
+#     * Brief Rationale: A short text snippet explaining the roles of the key genes that led to the identification
+#     * Top Marker Alignment: A list showing which input genes most strongly support the assigned label
+
+# %% [markdown]
+# ### 1.3 mLLM CellType
+
+# %% [markdown]
+# How it works:
+#
+# * Input: Differentially expressed marker genes (e.g., from FindAllMarkers) and critical metadata like tissue context (e.g., "human brain"), species, and experimental condition
+# * Reference: 
+#     * Collective Intelligence: Does not rely on a single database; instead, it synthesizes knowledge from an ensemble of SOTA models (e.g., GPT-5.2, Claude 4.5, Gemini 3 Pro, Qwen3)
+#     * Zero-Shot Learning: Functions without a pre-existing reference atlas by tapping into the models' internal biomedical training data
+# * Algorithm: 
+#     * Initial Annotation: Multiple LLMs independently propose cell type labels and provide biological reasoning for their choice
+#     * Structured Deliberation: For clusters where models disagree (controversial clusters), the framework initiates a "discussion" phase. Models share their reasoning and cross-evaluate each other's arguments
+#     * Consensus Checker (CC): A lead model (e.g., Claude 4.5 or GPT-5) acts as a moderator to synthesize the discussion and reach a final consensus
+#     * Uncertainty Quantification: It calculates the Consensus Proportion (CP) (level of agreement) and Shannon Entropy (H) (diversity of opinions) to flag ambiguous results for human review
+# * Output: 
+#     * Consensus Label: The most probable cell type agreed upon by the ensemble
+#     * Uncertainty Metrics: CP and Shannon Entropy values for every cluster
+#     * Full Reasoning Log: A transparent record of the debate between models, documenting why specific markers led to the final label
+
+# %% [markdown]
+# ### 1.4 DeepCellSeek
+
+# %% [markdown]
+# How it works:
+#
+# * Input: Ranked marker gene lists (top loadings) and specific "Niche" information (e.g., "Human Gut - Inflammatory Bowel Disease")
+# * Reference: 
+#     * Multi-LLM Ensemble: Queries a "Council" of the latest models (e.g., GPT-5, Claude 4.1, and Gemini 2 Ultra)
+#     * Consensus Database: Aggregates knowledge from established ontologies (CL, MeSH) and recent publication pre-prints
+# * Algorithm: 
+#     * Systematic Benchmarking: The tool was built by benchmarking 34 datasets to identify the "optimal" prompt engineering for cell annotation
+#     * Majority Voting: It sends the same gene list to multiple LLMs and uses a weighted voting system to determine the final label
+#     * Subtype Resolution: It specifically triggers "Deep Dive" prompts when it detects ambiguity between similar cells (e.g., distinguishing different states of Macrophages)
+# * Output: 
+#     * Consensus Label: The final agreed-upon cell type name
+#     * Ensemble Agreement Score: A percentage showing how many of the internal models agreed on the label
+#     * Evidence Summary: A concise list of literature-backed reasons why specific markers (from your DRVI list) point to the chosen label
+
+# %% [markdown]
+# ### 1.5 CellAgent
+
+# %% [markdown]
+# How it works: REQUIRES API KEYS
+#
+# * Input: High-confidence marker gene lists (e.g., top genes from DRVI factor loadings) and study metadata (e.g., tissue type, species)
+# * Reference: 
+#     * External Knowledge Integration: Actively queries curated databases like CellMarker, PanglaoDB, and Azimuth
+#     * Internal LLM Corpus: Leverages the vast biological literature embedded in Large Language Models (typically GPT-4 or GPT-5)
+# * Algorithm: multi agent orchestration
+#     * The Planner: Formulates a search strategy based on the input context
+#     * The Executor: Retrieves evidence from databases and matches input genes against known cell-type signatures
+#     * The Evaluator: Critically reviews the proposed labels for biological plausibility and cross-references them with the original data
+#     --> Iterative Reasoning: If the Evaluator detects a mismatch (e.g., a "Muscle cell" label for a "Brain" sample), the agents enter a feedback loop to refine the search and resolve conflicts
+# * Output: 
+#     * Predicted Cell Type: The final consensus label for the cell cluster or factor
+#     * Confidence Score: A metric indicating the certainty of the multi-agent agreement
+#     * Reasoning Trace: A step-by-step logical justification (narrative) explaining the biological evidence used for the decision
+#     * Marker Validation: A list of specific input genes that were successfully validated against the reference databases
+
+# %% [markdown]
+# ## 2. Annotation of Biological Processes (Funtional Identity)
 
 # %% [markdown]
 # Goal: Identify biological processes (e.g., "Interferon Response", "Cell Cycle") for factors that do not map 1-to-1 to a cell type.
 #
 # Tools to Compare:
-# * gProfiler (gprofiler-official): The benchmark used in the DRVI preprint
-# * Gseapy: Python implementation for local Enrichment analysis (Enrichr/MSigDB)
-# * Decoupler: A fast framework for footprint-based enrichment (e.g., PROXIMA)
-# * Blitzqseq
+#
+# * Gene Set Enrichment Analysis:
+#     * gProfiler (gprofiler-official): The benchmark used in the DRVI preprint
+#     * Gseapy: Python implementation for local Enrichment analysis (Enrichr/MSigDB)
+#     * Decoupler: A fast framework for footprint-based enrichment (e.g., PROXIMA)
+#     * Blitzqseq
+# * LLM-based tools:
+#     * Requires API keys:
+#         * AnnDictionary: It provides a structured metadata framework within AnnData objects to map latent representations and gene sets to standardized biological vocabularies using LLM-backed dictionaries
+#         *  Cell Agent: It employs a multi-agent "Plan-and-Execute" hierarchy where specialized AI agents collaborate to perform data tool manipulation, literature retrieval, and iterative biological reasoning
+#     * Does NOT require API keys or can use local open-source resources:
+#         * EnrichGT: It bridges classical statistics and semantics by taking raw ORA/GSEA results and using LLMs to perform intelligent clustering and context-aware summarization of biological pathways
+#         * Cell2Text-V2: It transforms numerical gene expression matrices and factor loadings into coherent natural language descriptions by leveraging refined prompt engineering and retrieval-augmented domain knowledge
+#
+#
 #
 # Key Metrics:
 
@@ -812,18 +946,7 @@ display(celltypist_summary[celltypist_summary["Significant"]].head(20))
 # #### BlitzGSEA Library
 
 # %%
-# MSigDB Hallmark is the gold standard for the first evaluation
-signature_lib = blitz.enrichr.get_library("MSigDB_Hallmark_2020")
-
-
-# %%
-#Return the first column name from candidates that exists in df. Handles varying column naming conventions across blitzgsea/gseapy versions
-def _pick_col(df: pd.DataFrame, candidates):
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
+signature_lib = blitz.enrichr.get_library(GSEA_DB)
 
 # %% [markdown]
 # ##### GSEA
@@ -862,11 +985,10 @@ blitzgsea_summary = pd.concat(blitz_rows, ignore_index=True) if blitz_rows else 
 
 
 # %%
-sig_blitz
-
-# %%
-sig_blitz = blitzgsea_summary.query("FDR < @FDR")[["FactorDir", "Term", "FDR"]]
-blitz_smi_table = build_smi_and_display(sig_blitz, "FactorDir", "Term", "FDR", "BlitzGSEA")
+sig_blitz = blitzgsea_summary.query("FDR < @FDR")[["FactorDir", "Term", "NES", "FDR"]].copy()
+sig_blitz["Factor"] = strip_factor(sig_blitz["FactorDir"]).values
+sig_blitz = _enrich_sig(sig_blitz, blitzgsea_summary, "FactorDir", "NES", use_nes=True)
+display(sig_blitz.sort_values("FDR"))
 
 # %% [markdown]
 # #### BlitzGSEA Summary
@@ -959,12 +1081,12 @@ for factor_dir, s in ranked_inputs.items():
 gseapy_summary = pd.concat(gseapy_rows, ignore_index=True) if gseapy_rows else pd.DataFrame(columns=["FactorDir", "Term", "NES", "FDR"])
 
 
-# %%
-sig_gseapy = gseapy_summary.query("FDR < @FDR")[["FactorDir","Term","FDR"]]
-display(sig_gseapy.sort_values("FDR").head(30))
 
 # %%
-gseapy_smi_table = build_smi_and_display(sig_gseapy, "FactorDir", "Term", "FDR", "GSEApy")
+sig_gseapy = gseapy_summary.query("FDR < @FDR")[["FactorDir", "Term", "NES", "FDR"]].copy()
+sig_gseapy["Factor"] = strip_factor(sig_gseapy["FactorDir"]).values
+sig_gseapy = _enrich_sig(sig_gseapy, gseapy_summary, "FactorDir", "NES", use_nes=True)
+display(sig_gseapy.sort_values("FDR"))
 
 # %% [markdown]
 # #### Gseapy Summary
@@ -1050,14 +1172,19 @@ gprofiler_valid = [x for x in gprofiler_parts if not x.empty]
 gprofiler_res = pd.concat(gprofiler_valid, ignore_index=True) if gprofiler_valid else pd.DataFrame()
 
 
+
 # %%
 sig_gprof = gprofiler_res.query("p_value < @FDR").copy()
 sig_gprof["Term"] = sig_gprof["name"] if "name" in sig_gprof else sig_gprof["native"]
-display(sig_gprof[["factor","Term","p_value"]].sort_values("p_value").head(30))
+sig_gprof = sig_gprof.rename(columns={"factor": "Factor"})
+sig_gprof = _enrich_sig(
+    sig_gprof,
+    gprofiler_res.rename(columns={"factor": "Factor"}),
+    "Factor", "p_value",
+)
+display(sig_gprof[["Factor", "Term", "p_value", "Specificity", "Annot_Label", "Annot_SMI"]]
+        .sort_values("p_value").head(20))
 
-
-# %%
-gprofiler_smi_table = build_smi_and_display(sig_gprof, "factor", "Term", "p_value", "g:Profiler")
 
 # %% [markdown]
 # #### Summary
@@ -1148,6 +1275,18 @@ def run_decouple(df_factors_by_genes: pd.DataFrame, direction: str) -> pd.DataFr
         tmin=DC_TMIN,
         verbose=False,
     )
+    if DC_USE_CONSENSUS and len(DC_METHODS) > 1:
+        _, pvals = dc.mt.consensus(res)
+    else:
+        key = f"pvals_{DC_PRIMARY_METHOD}"
+        if key not in res:
+            return pd.DataFrame(columns=["factor", "term", "p_value", "direction"])
+        pvals = res[key]
+
+    out = pvals.stack().rename("p_value").reset_index()
+    out.columns = ["factor", "term", "p_value"]
+    out["direction"] = direction
+    return out
 
 
 # %% [markdown]
@@ -1164,14 +1303,11 @@ print("unique terms:", decoupler_res["term"].nunique())
 print("significant rows:", (decoupler_res["p_value"] < FDR).sum())
 
 # %%
-sig_dec = decoupler_res.query("p_value < @FDR")[["factor","term","p_value"]]
-display(sig_dec.sort_values("p_value").head(30))
-
-
-# %%
-sig_dec_with_term = sig_dec.copy()
-sig_dec_with_term["Term"] = sig_dec_with_term["term"]
-decoupler_smi_table = build_smi_and_display(sig_dec_with_term, "factor", "Term", "p_value", "decoupler")
+sig_dec = decoupler_res.query("p_value < @FDR")[["factor", "term", "p_value"]].copy()
+sig_dec = sig_dec.rename(columns={"factor": "Factor"})
+spec = compute_tool_specificity(decoupler_res.rename(columns={"factor": "Factor"}), "Factor", "p_value")
+sig_dec = sig_dec.merge(annot_map, on="Factor", how="left").merge(spec, left_on="Factor", right_index=True, how="left")
+display(sig_dec.sort_values("p_value"))
 
 # %% [markdown]
 # #### Summary
@@ -1253,201 +1389,6 @@ pd.set_option("display.max_columns", None)
 pd.set_option("display.max_colwidth", None)
 
 display(eval_matrix_sig.dropna(how="all"))
-
-# %%
-import re
-
-def base_factor(x):
-    x = str(x)
-    x = re.sub(r'(_pos|_neg)$', '', x)
-    x = re.sub(r'([+-])$', '', x)
-    return x
-
-def top_gseapy_sig(df):
-    if df is None or df.empty: return pd.DataFrame(columns=["factor","gseapy"])
-    x = df[df["FDR"] < FDR].copy()
-    if x.empty: return pd.DataFrame(columns=["factor","gseapy"])
-    x["factor"] = x["FactorDir"].map(base_factor)
-    x = x.sort_values(["FDR","NES"], ascending=[True, False]).groupby("factor", as_index=False).head(1)
-    x["gseapy"] = x["Term"].astype(str) + " | NES=" + x["NES"].round(2).astype(str)
-    return x[["factor","gseapy"]]
-
-def top_blitz_sig(df):
-    if df is None or df.empty: return pd.DataFrame(columns=["factor","blitzgsea"])
-    x = df[df["FDR"] < FDR].copy()
-    if x.empty: return pd.DataFrame(columns=["factor","blitzgsea"])
-    x["factor"] = x["FactorDir"].map(base_factor)
-    x = x.sort_values(["FDR","NES"], ascending=[True, False]).groupby("factor", as_index=False).head(1)
-    x["blitzgsea"] = x["Term"].astype(str) + " | NES=" + x["NES"].round(2).astype(str)
-    return x[["factor","blitzgsea"]]
-
-def top_gprof_sig(df):
-    if df is None or df.empty: return pd.DataFrame(columns=["factor","gprofiler"])
-    x = df[df["p_value"] < FDR].copy()
-    if x.empty: return pd.DataFrame(columns=["factor","gprofiler"])
-    term_col = "name" if "name" in x.columns else "native"
-    x["factor"] = x["factor"].map(base_factor)
-    x = x.sort_values("p_value").groupby("factor", as_index=False).head(1)
-    x["gprofiler"] = x[term_col].astype(str) + " | p=" + x["p_value"].map(lambda v: f"{v:.2e}")
-    return x[["factor","gprofiler"]]
-
-def top_dec_sig(df):
-    if df is None or df.empty: return pd.DataFrame(columns=["factor","decoupler"])
-    x = df[df["p_value"] < FDR].copy()
-    if x.empty: return pd.DataFrame(columns=["factor","decoupler"])
-    x["factor"] = x["factor"].map(base_factor)
-    x = x.sort_values("p_value").groupby("factor", as_index=False).head(1)
-    x["decoupler"] = x["term"].astype(str) + " | p=" + x["p_value"].map(lambda v: f"{v:.2e}")
-    return x[["factor","decoupler"]]
-
-def top_celltypist_sig(df):
-    if df is None or df.empty: return pd.DataFrame(columns=["factor","celltypist"])
-    x = df.copy()
-    fac_col = "Factor" if "Factor" in x.columns else ("factor" if "factor" in x.columns else None)
-    ct_col = "Top_CellType" if "Top_CellType" in x.columns else ("CellType" if "CellType" in x.columns else None)
-    corr_col = "Correlation" if "Correlation" in x.columns else None
-    if fac_col is None or ct_col is None or corr_col is None:
-        return pd.DataFrame(columns=["factor","celltypist"])
-
-    # nutzt deine vorhandenen thresholds
-    x = x[(x[corr_col] >= CT_CORR_THRESHOLD) & (x["Specificity"] >= CT_SPEC_THRESHOLD)].copy()
-    if x.empty: return pd.DataFrame(columns=["factor","celltypist"])
-
-    x["factor"] = x[fac_col].map(base_factor)
-    x = x.sort_values(corr_col, ascending=False).groupby("factor", as_index=False).head(1)
-    x["celltypist"] = x[ct_col].astype(str) + " | corr=" + x[corr_col].round(2).astype(str)
-    return x[["factor","celltypist"]]
-
-def top_annotation_sig(smi_df, label_col="annotation"):
-    """
-    Bestimmt für jeden Faktor die Annotation mit maximalem SMI
-    und formatiert sie als Textspalte für die Vergleichstabelle.
-    """
-    if smi_df is None or smi_df.empty:
-        return pd.DataFrame(columns=["factor", label_col])
-
-    # Annahme: Index = Faktor-Titel (z.B. "DR 1"), Spalten = Annotationen
-    x = smi_df.copy()
-
-    # Top-Label und SMI pro Faktor
-    top_label = x.idxmax(axis=1)
-    top_smi = x.max(axis=1)
-
-    out = (
-        pd.DataFrame({
-            "factor": top_label.index.astype(str),
-            "Top_Label": top_label.values.astype(str),
-            "Top_SMI": top_smi.values,
-        })
-    )
-
-    # Konsistenz zu den anderen Funktionen: Faktor-Namen normalisieren
-    # (base_factor kennst du bereits aus den top_*_sig-Helpern)
-    if "base_factor" in globals():
-        out["factor"] = out["factor"].map(base_factor)
-
-    out[label_col] = (
-        out["Top_Label"].astype(str)
-        + " | SMI=" + out["Top_SMI"].round(2).astype(str)
-    )
-
-    return out[["factor", label_col]]
-
-m = top_gseapy_sig(gseapy_summary)
-m = m.merge(top_blitz_sig(blitzgsea_summary), on="factor", how="outer")
-m = m.merge(top_gprof_sig(gprofiler_res), on="factor", how="outer")
-m = m.merge(top_dec_sig(decoupler_res), on="factor", how="outer")
-m = m.merge(top_celltypist_sig(celltypist_summary), on="factor", how="outer")
-m = m.merge(top_annotation_sig(smi_similarity), on="factor", how="outer")
-
-eval_matrix_sig = m.sort_values("factor").set_index("factor")
-
-pd.set_option("display.max_rows", None)
-pd.set_option("display.max_columns", None)
-pd.set_option("display.max_colwidth", None)
-
-display(eval_matrix_sig.dropna(how="all"))
-
-
-# %% [markdown]
-# #### Consistency Heatmap (Rank Correlation)
-
-# %%
-# Build consistency heatmap: compare term rankings across tools.
-# For each tool, -log10(p-value) scores are computed per factor-term pair.
-# Terms are ranked within each tool, and Spearman rank correlation between
-# tools measures how consistently they identify the same biological programs.
-TOP_K = 20    # Number of top-ranked terms to include in the heatmap
-FACTOR_FILTER = None
-
-#  Normalize term names (lowercase, replace non-alphanumeric with underscore)
-def norm_term(s):
-    return (pd.Series(s).astype(str).str.lower()
-            .str.replace(r"[^a-z0-9]+", "_", regex=True).str.strip("_"))
-
-tool_configs = [
-    ("gseapy", "gseapy_summary", "FactorDir", "Term", "FDR"),
-    ("blitzgsea", "blitzgsea_summary", "FactorDir", "Term", "FDR"),
-    ("gprofiler", "gprofiler_res", "factor", None, "p_value"),
-    ("decoupler", "decoupler_res", "factor", "term", "p_value"),
-]
-
-parts = []
-for tool, var_name, fac_col, term_col, score_col in tool_configs:
-    df = globals().get(var_name)
-    if df is None or df.empty:
-        continue
-    x = df.copy()
-    if term_col is None:
-        term_col = "name" if "name" in x.columns else "native"
-    x["factor"] = strip_factor(x[fac_col])
-    x["term"] = norm_term(x[term_col])
-    x["score"] = -np.log10(pd.to_numeric(x[score_col], errors="coerce"))
-    x["tool"] = tool
-    parts.append(x[["tool", "factor", "term", "score"]])
-
-rank_df = pd.concat(parts, ignore_index=True).dropna(subset=["score"])
-if FACTOR_FILTER is not None:
-    rank_df = rank_df[rank_df["factor"] == FACTOR_FILTER].copy()
-
-rank_df = rank_df.groupby(["tool", "term"], as_index=False)["score"].max()
-rank_df["rank"] = rank_df.groupby("tool")["score"].rank(ascending=False, method="dense")
-rank_df.head()
-
-
-# %%
-# Pivot to a term x tool rank matrix and compute pairwise Spearman correlation.
-# Spearman's rho measures monotonic agreement between rank orderings:
-# rho = 1 means tools rank terms identically, rho = 0 means no agreement.
-top_terms = rank_df[rank_df["rank"] <= TOP_K]["term"].unique()
-r = rank_df[rank_df["term"].isin(top_terms)].copy()
-
-rank_mat = r.pivot(index="term", columns="tool", values="rank")
-corr = rank_mat.corr(method="spearman", min_periods=3)
-
-plt.figure(figsize=(6,5))
-sns.heatmap(corr, annot=True, vmin=-1, vmax=1, cmap="vlag", square=True)
-plt.title(f"Tool Consistency (Spearman), Top {TOP_K} Terms" + (f" | {FACTOR_FILTER}" if FACTOR_FILTER else ""))
-plt.show()
-
-# %% [markdown]
-# #### Leading-Edge-Gen-Overlap
-
-# %% [markdown]
-# #### Computing Time
-
-# %% [markdown]
-# ### 3. Language Model Based Identification (Advanced Annotation)
-
-# %% [markdown]
-# Goal: Automate "narrative" annotation and validation using LLMs.
-#
-# Tools to Compare:
-# * gsai (Gene Set AI): Specialized LLM tool for gene list interpretation.
-# * Direct LLM Prompting: Using GPT-4/Claude via API to summarize factor-defining genes.
-# * OpenScholar: For literature-backed validation of the proposed factor names.
-#
-# Key Metrics:
 
 # %% [markdown]
 # ### 4. Final Integration & Verification
