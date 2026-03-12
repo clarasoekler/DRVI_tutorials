@@ -1548,12 +1548,7 @@ def run_blitzgsea_db(db_name, min_size=10, max_size=500):
 
 
 def run_gseapy_db(db_name, min_size=10, max_size=500):
-    try:
-        lib = gseapy.get_library(db_name)
-    except Exception as e:
-        # Enrichr API often unreachable on clusters; use blitzgsea's library (same Enrichr content)
-        logging.warning("gseapy.get_library(%s) failed (%s); using blitzgsea enrichr fallback.", db_name, e)
-        lib = blitz.enrichr.get_library(db_name)
+    lib = gseapy.get_library(db_name)
     rng = np.random.default_rng(seed=42)
     rows = []
     for factor_dir, s in ranked_inputs.items():
