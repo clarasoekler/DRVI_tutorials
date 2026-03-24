@@ -6,7 +6,7 @@
 #       extension: .py
 #       format_name: light
 #       format_version: '1.5'
-#       jupytext_version: 1.18.1
+#       jupytext_version: 1.19.1
 #   kernelspec:
 #     display_name: python_apptainer
 #     language: python
@@ -15,12 +15,14 @@
 
 # # Transfer learning to new dataset (query to reference mapping)
 
-# In this notebook, we train a DRVI model on reference data and transfer processes and embedings to a query data. DRVI uses acArches approach internally. This covers:
+# In this notebook, we train a DRVI model on reference data and transfer processes and embeddings to query data. DRVI uses the scArches approach internally. This covers:
 #
 # - Training DRVI
 # - Query to reference mapping
 # - Observe the integrated latent space in UMAP
 # - Observe transferred factors
+#
+# **IMPORTANT:** Set `encode_covariates=True` when initializing the model (not default). This ensures the model uses batch information in the encoder, which is essential for query to reference mapping.
 
 # ## Contact
 
@@ -42,9 +44,9 @@ branch = "latest"
 IN_COLAB = "google.colab" in sys.modules
 
 if IN_COLAB and branch == "stable":
-    # !pip install multigrate[tutorials]
+    # !pip install drvi-py[tutorials]
 elif IN_COLAB and branch != "stable":
-    # !pip install git+https://github.com/theislab/drvi.git#egg=drvi[tutorials]
+    # !pip install git+https://github.com/theislab/drvi.git#egg=drvi-py[tutorials]
 # -
 
 # ## Imports
@@ -80,7 +82,7 @@ plt.rcParams["figure.figsize"] = (3, 3)
 # ## Config
 
 # +
-# Set this to false if you already trained your model and do not like to retrain.
+# Set this to false if you already trained your model and do not want to retrain.
 overwrite = False
 SEED = 1  # Set to None if you don't want to set seed
 
@@ -91,21 +93,31 @@ io_dir.mkdir(parents=True, exist_ok=True)
 io_dir
 # -
 
-# ## Load Data
+# ## Download data
 
-# + magic_args="-s \"$io_dir\"" language="bash"
-# export io_dir=$1
-#
-# # Download Example Immune dataset if it does not exist
-# if [ ! -f $io_dir/immune_all.h5ad ]; then
-#   curl -L https://figshare.com/ndownloader/files/25717328 -o $io_dir/immune_all.h5ad
-#   echo "File downloaded successfully."
-# else
-#   echo "File already exists."
-# fi
+input_anndata_path = io_dir.parent / "immune_all.h5ad"
+input_anndata_path
+
+# +
+# Run this cell only if you need to download the data
+import requests
+
+url = f"https://api.figshare.com/v2/file/download/25717328"
+
+if input_anndata_path.exists():
+    print("File already exists.")
+else:
+    print("Downloading ...")
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(input_anndata_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024*1024): f.write(chunk)
+    print(f"Successfully downloaded: {input_anndata_path}")
 # -
 
-adata = sc.read_h5ad(io_dir / "immune_all.h5ad")
+# ## Load Data
+
+adata = sc.read_h5ad(input_anndata_path)
 # Remove dataset with non-count values
 adata = adata[adata.obs["batch"] != "Villani"].copy()
 # We shuffle the data for better visualization. Otherwise order of points in UMAP will not be random.
@@ -121,7 +133,7 @@ adata
 
 adata.obs['study'].unique()
 
-# Holding out an unseed dataset as query
+# Holding out an unseen dataset as query
 adata_ref = adata[adata.obs['study'] != 'Sun'].copy()
 adata_query = adata[adata.obs['study'] == 'Sun'].copy()
 
@@ -132,7 +144,7 @@ adata_query = adata_query[:, hvg_genes].copy()
 adata_ref, adata_query
 
 
-# Save pre-processes data for next notebooks
+# Save pre-processed data for next notebooks
 if overwrite or not (io_dir / "adata_preprocesses_ref.h5ad").exists():
     adata_ref.write_h5ad(io_dir / "adata_preprocesses_ref.h5ad")
 if overwrite or not (io_dir / "adata_preprocesses_query.h5ad").exists():
@@ -144,6 +156,7 @@ del adata
 
 # +
 # You can also skip this cell if model is already trained
+# For more details on training params please refer to the general pipeline notebook
 
 # Setup data
 DRVI.setup_anndata(
@@ -151,7 +164,7 @@ DRVI.setup_anndata(
     layer="counts",
     batch_key="batch",
     # In addition to batch_key, you can also provide additional `categorical_covariate_keys`.
-    # DRVI supports query to reference mapping with new categorical covatiates.
+    # DRVI supports query to reference mapping with new categorical covariates.
     is_count_data=True,
 )
 
@@ -162,12 +175,9 @@ scvi.settings.seed = SEED
 model = DRVI(
     adata_ref,
     n_latent=128,
-    # IMPORTANT: you need to allow encoder to get covatiates as input to be able to do query to reference mapping
+    # IMPORTANT: you need to allow encoder to get covariates as input to be able to do query to reference mapping
     encode_covariates=True,
     # For encoder and decoder dims, provide a list of integers.
-    encoder_dims=[128, 128],
-    decoder_dims=[128, 128],
-    # dispersion='gene-batch',  # depending on the variability of gene dispersions use 'gene' or 'gene-batch'
 )
 model
 
@@ -200,7 +210,7 @@ model = DRVI.load(model_path, adata_ref)
 model
 
 embed_ref = ad.AnnData(model.get_latent_representation(adata_ref), obs=adata_ref.obs)
-drvi.utils.tl.set_latent_dimension_stats(model, embed_ref, vanished_threshold=0.1)
+model.set_latent_dimension_stats(embed_ref, vanished_threshold=0.5)
 embed_ref.write_h5ad(io_dir / "embed_ref.h5ad")
 
 # If you are interested to observe your latent space and latent factors of the reference model, please have a look at the main tutorial.
@@ -281,5 +291,10 @@ drvi.utils.pl.plot_latent_dims_in_heatmap(embed_ref, "final_annotation", title_c
 
 embed_query.var = embed_ref.var.copy()
 drvi.utils.pl.plot_latent_dims_in_heatmap(embed_query, "final_annotation", title_col="title")
+
+
+
+# ## Notes
+# For more details such as interpretability of latent factors please refer to other tutorials. 
 
 
