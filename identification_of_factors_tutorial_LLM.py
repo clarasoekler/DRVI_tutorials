@@ -23,55 +23,40 @@
 # In this notebook, we use the already trained DRVI model on the immune dataset to identify biological processes captured by each latent factor. We combine multiple complementary annotation strategies:
 #
 # 1. **Cell type annotation** — match factors to known cell types using existing labels, pre-trained classifiers (CellTypist), enrichment based tools (BlitzGSEA) and LLM-based tools (AnnDictionary and CASSIA)
-# 2. **Biological process annotation** — identify enriched pathways and regulatory programs using gene set enrichment analysis (BlitzGSEA, GSEApy), over-representation analysis (g:Profiler), regulator activity inference (decoupler), and LLM-based summarization (gs2txt, AnnDictionary)
+# 2. **Annotation of Biological Processes** using
+#     * a. **Gene set enrichment analysis (GSEA)** — identify enriched pathways from ranked gene lists (BlitzGSEA, GSEApy)
+#     * b. **Over-representation analysis (ORA)** — test for enriched gene sets using ordered queries (g:Profiler)
+#     * c. **Regulator activity inference** — infer transcription factor or pathway activity using a statistical framework (decoupler) integrated with prior knowledge 
+#     * d. **LLM-based annotation** — interpret gene lists using large language models to propose biological process labels (gs2txt, AnnDictionary)
 #
 # Each tool operates on the gene-level interpretability scores produced by DRVI's built-in scoring API (`model.get_interpretability_scores`). DRVI provides two complementary scoring approaches that can be selected via the `INTERPRETABILITY_MODE` config variable:
 #
-# - **OOD (Out-of-Distribution)**: Uses decoder reconstructions to calculate per-gene effect scores. Recommended for identifying cell types and the most specific genes of a program.
-# - **IND (Within-Distribution)**:  Iterates over all cells to compute weighted mean effects. Captures broader mechanistic effects including shared genes.
+# - **OOD (Out-of-Distribution)**: Uses decoder reconstructions to calculate per-gene effect scores. This is our suggested method to consider for finding cell-types and most specific genes of a program.
+# - **IND (Within-Distribution)**: Iterates over all cells to compute weighted mean effects. Captures broader mechanistic effects including shared genes.
 #
 # All tools in this notebook are **guiding tools**: they summarize large gene-level patterns into interpretable scores, but they do **not** provide definitive labels. Their outputs should always be interpreted in context, compared across methods, and validated against known biology and the original data.
 #
 # **We always advise examination by a biologist and validation against published literature for any identified processes.**
-#
-# > **What is a latent factor?**
-# > Think of a latent factor as a "hidden program" that DRVI discovered in the data. Each factor captures a pattern of coordinated gene activity across cells — for example, a set of genes that turn on together in T cells, or genes that respond collectively to interferon signaling. Each factor has two directions (+ and −), representing opposite ends of that program (e.g., genes that go *up* vs. *down*). The goal of this notebook is to give each factor-direction a biological name by gathering evidence from multiple annotation tools.
 
 # %% [markdown]
-# ## Roadmap
-#
-# This tutorial follows a four-stage workflow. Each stage builds on the previous one and feeds into the **Curation Table** — the final deliverable where all evidence comes together.
-#
-# **Stage 0 · Setup and Prepare shared inputs** — Install dependencies, import libraries, configure paths and parameters. Load the DRVI model and its interpretability scores. Split them into per-factor-direction ranked gene lists that all downstream tools consume.
-#
-# **Stage 1 · Cell type annotation** — Determine which factors correspond to known cell types.
-# - *1.1 Known annotations (SMI)* — Align factors with existing cell-type labels via Scaled Mutual Information.
-# - *1.2 CellTypist* — Classify cells with a pre-trained atlas model and correlate predictions with factors.
-# - *1.3 Cell type enrichment (BlitzGSEA)* — Test whether a factor's top genes overlap curated marker gene sets (CellMarker, PanglaoDB).
-# - *1.4 AnnDictionary* — Ask an LLM to identify cell types from gene lists.
-# - *1.5 CASSIA* — Multi-agent LLM system with validation and quality scoring.
-#
-# **Stage 2 · Biological process annotation** — Annotate factors that capture pathways, signaling, or regulatory programs rather than a single cell type.
-# - *2.1 BlitzGSEA* — Fast pre-ranked GSEA with analytical null.
-# - *2.2 GSEApy* — Permutation-based GSEA (prerank) and Enrichr ORA.
-# - *2.3 g:Profiler* — Ordered-query ORA with hierarchical GO correction.
-# - *2.4 decoupler* — Infer transcription factor and pathway activity from prior knowledge networks.
-# - *2.5 gs2txt* — LLM-based summarization of gene sets into process descriptions.
-#
-# **Stage 3 · Curation & export** — Merge all tool outputs into a single curation table, add manual annotations, and store final labels in the embedding object.
-#
-# **Stage 4 · Visual validation** — Spot-check annotated factors on UMAP plots.
-#
-# > **Sections are independent within each stage.** You can skip any tool you don't need (e.g., skip CellTypist if no model matches your tissue, skip LLM sections if no LLM backend is available). 
+# ## Roadmap of this tutorial
+# * Install & import 
+# * Global configurations
+# * Load data & model 
+# * (0) Prepare shared inputs 
+# * (1) Cell-type annotation (SMI, CellTypist, Enrichment, AnnDictionary, CASSIA)
+# * (2) Biological process annotation (BlitzGSEA, GSEApy, g:Profiler, decoupler, gs2txt)
+# * (3) Curation table and Manual labeling
+# * (4) Visual validation
 
 # %% [markdown]
-# ## Prerequisites
+# ## Intro
 #
 # This notebook assumes that you have already trained a DRVI model and computed the interpretability scores (via `model.calculate_interpretability_scores` in the general pipeline).
 #
 # Please refer to the [General training and interpretability pipeline](./general_pipeline.html) tutorial.
 #
-# While we use the immune dataset as a running example, all code is dataset-agnostic. Global configuration (paths, species, thresholds, LLM backend) is defined in the **Global Configurations** section. Each tool section has its own config cell for tool-specific settings (e.g., database choice, model name).
+# While we use the immune dataset as a running example, all code is dataset-agnostic. Global configuration (paths, species, thresholds, LLM backend) is defined in the Config cell below. Each tool section has its own config cell for tool-specific settings (e.g., database choice, model name).
 
 # %% [markdown]
 # ## Contact
@@ -134,6 +119,7 @@
 #   - `OLLAMA_URL` and `OLLAMA_MODEL` in the Config cell control all three LLM tools (AnnDictionary, CASSIA, gs2txt).
 #   - For local inference: set up Ollama following the setup guide in §1.4–1.5 and point `OLLAMA_URL` to your server.
 #   - For cloud providers: update the provider and API key in each tool's config cell (see each tool's GitHub for supported backends).
+#   - If no LLM is available, skip sections 1.4, 1.5, 2.5, and the LLM columns in the curation table will remain empty.
 #
 # - **9. Manual curation**
 #   - Use the exported `factor_annotation_curation.csv` as your central place to:
@@ -142,10 +128,7 @@
 #   - Re-import the curated CSV and re-run the final cells to store `embed.var["annotation_final"]` and `embed.var["annotation_source"]` with your labels.
 
 # %% [markdown]
-# ## 0. Setup and prepare shared inputs
-
-# %% [markdown]
-# ### Install
+# ## Install
 #
 # If you try DRVI on colab, the next cell will install dependencies.
 #
@@ -170,7 +153,7 @@ if IN_COLAB:
                            "anndict","CASSIA", "gs2txt"])
 
 # %% [markdown]
-# ### Imports
+# ## Imports
 
 # %%
 import warnings
@@ -178,7 +161,10 @@ warnings.filterwarnings("ignore")
 
 # %%
 import numpy as np
+from numpy import mat
 import pandas as pd
+import anndata as ad
+from anndata import AnnData
 import scanpy as sc
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -187,19 +173,24 @@ import scvi
 import drvi
 from pathlib import Path
 from drvi.model import DRVI
+from drvi.utils.misc import hvg_batch
 
 # %%
 print("Last run with scvi-tools version:", scvi.__version__)
 print("Last run with DRVI version:", drvi.__version__)
 
 # %% [markdown]
-# ### Global Configurations
-# All parameters that control this tutorial are set in the next two cells. Tool-specific settings (database choices, model names) are set at the top of each tool section.
+# ## Global Configurations
 
 # %%
 # Plot defaults
-sc.settings.set_figure_params(dpi=100, frameon=False, figsize=(3, 3))
-plt.rcParams.update({"axes.labelsize": 14, "xtick.labelsize": 14, "ytick.labelsize": 14})
+sc.settings.set_figure_params(dpi=100, frameon=False)
+sc.set_figure_params(figsize=(3, 3))
+plt.rcParams["figure.dpi"] = 100
+plt.rcParams["figure.figsize"] = (3, 3)
+plt.rcParams["axes.labelsize"] = 14
+plt.rcParams["xtick.labelsize"] = 14
+plt.rcParams["ytick.labelsize"] = 14
 
 # %%
 # ---- Set input output directory ----
@@ -227,10 +218,7 @@ print(f"Interpretability mode: {INTERPRETABILITY_MODE} (score_key={score_key!r})
 significance_threshold = 0.05
 
 # ---- Cell-type annotation ----
-# Column in adata.obs containing cell type labels. Set to None if not available.
-annot_col = "final_annotation"
-# Minimum SMI score to consider a factor associated with a cell type.
-smi_threshold = 0.5
+smi_threshold = 0.5 # # Minimum SMI score between factor and cell-type probability profiles to consider a factor as associated with a cell type. Adjust as needed.
 
 # ---- Species (used by g:Profiler, decoupler, LLM tools) ----
 organism = "hsapiens"       # g:Profiler format: "hsapiens", "mmusculus"
@@ -240,7 +228,7 @@ llm_species = "Homo sapiens"
 UPPERCASE_GENES = True  # Set False for mouse or other species with mixed-case gene symbols
 
 # %% [markdown]
-# ### Ollama setup guide 
+# #### Ollama setup guide 
 #
 # Ollama is an open-source free tool that lets you run and manage large language models (like Llama 3 or Qwen) locally on your own hardware or cluster
 #
@@ -294,8 +282,8 @@ import requests
 
 # ---- OLLAMA CONFIGURATION (shared by AnnDictionary, CASSIA, gs2txt)----
 
-# Ensure you have run: ollama pull qwen2.5:latest
-NODE_NAME = "supergpu23.scidom.de" # Update with your node's hostname 
+# Ensure you have run: ollama pull qwenw.5:latest
+NODE_NAME = "supergpu25.scidom.de" # Update with your node's hostname 
 OLLAMA_PORT = "8979" # Update if you used a different port when starting the server
 
 # Use the exact name from your 'ollama list' output
@@ -306,6 +294,7 @@ OLLAMA_URL = f"http://{NODE_NAME}:{OLLAMA_PORT}"
 # Biological Context
 llm_top_n_genes = 30
 llm_tissue_context = "human bone marrow / immune"
+llm_species = llm_species
 
 # Standardized output columns for all tools
 LLM_COLS = [
@@ -325,7 +314,7 @@ except Exception as e:
     print(f"❌ Error: {e}")
 
 # %% [markdown]
-# ### Load Data
+# ## Load Data
 
 # %%
 # Update this path to point to your project directory
@@ -333,7 +322,7 @@ adata = sc.read_h5ad(io_dir / "adata_preprocesses.h5ad")
 adata
 
 # %% [markdown]
-# ### Load DRVI outputs
+# ## Load DRVI outputs
 
 # %%
 model_path = io_dir / "drvi_model"
@@ -344,7 +333,7 @@ model = DRVI.load(model_path, adata)
 embed = sc.read_h5ad(embed_path)
 
 # %% [markdown]
-# ### Prepare shared inputs
+# ## 0. Prepare shared inputs
 #
 # All annotation tools operate on the gene-level interpretability scores computed by DRVI. For each latent factor, the positive (+) and negative (−) direction each produce a vector of per-gene scores that quantify how much each gene's predicted expression changes. These scores serve as:
 #
@@ -396,8 +385,7 @@ print(f"Background genes: {len(all_genes)}")
 
 
 # %% [markdown]
-# ### Helper functions
-# These utilities standardize gene names, build ranked gene lists, and provide a shared iterator over all factor-directions. They are used by every tool below.
+# #### Helper functions
 
 # %%
 # Function to build standardized inputs for enrichment tools from the raw scores DataFrames.
@@ -445,13 +433,10 @@ print(f"Genes per ranked list: {len(next(iter(pos_ranked.values())))}")
 # %% [markdown]
 # ## 1. Cell type annotation
 #
-# Some latent factors capture cell-type identity. We identify these using five complementary approaches:
-#
-# - **1.1 Known annotations (SMI)** — if your dataset has cell-type labels, measure alignment via Scaled Mutual Information.
-# - **1.2 CellTypist** — classify cells with a pre-trained atlas model and correlate predictions with factors.
-# - **1.3 Cell type enrichment (BlitzGSEA)** — test factor gene lists against curated marker databases (CellMarker, PanglaoDB).
-# - **1.4 AnnDictionary** — LLM-based cell type annotation from gene lists.
-# - **1.5 CASSIA** — multi-agent LLM annotation with quality scoring.
+# Some latent factors capture cell-type identity. We can identify these using:
+# - **Known annotations** (if available): measure alignment between factors and annotated cell types via Scaled Mutual Information (SMI)
+# - **CellTypist**: classify cells using pre-trained models and correlate class probabilities with factor activities
+# - (Not described in this tutorial: using GSEA/ORA methods with Cell Type databases)
 
 # %% [markdown]
 # ### 1.1 Known annotations (SMI)
@@ -471,8 +456,8 @@ import networkx as nx
 from drvi.utils.metrics import DiscreteDisentanglementBenchmark
 
 # %%
-# annot_col is set in Global Configurations above.
-# Change it there if you need a different column.
+# Column in adata.obs containing cell type labels. Set to None if not available.
+annot_col = "final_annotation" 
 
 # %% [markdown]
 # #### Scaled Mutual Information
@@ -570,7 +555,7 @@ plot_packed_network(smi_top_matches)
 # %% [markdown]
 # ### 1.2 CellTypist
 #
-# [CellTypist](https://www.celltypist.org/) uses pre-trained logistic regression models trained on large-scale annotated atlases to classify individual cells. We calculate the Scaled Mutual Information (SMI) between the CellTypist probability matrix (cells × cell types) and the DRVI factor activity matrix (cells × factors) to identify which factors correspond to which cell types.
+# [CellTypist](https://www.celltypist.org/) uses pre-trained logistic regression models trained on large-scale annotated atlases to classify individual cells. We calculate the Similarity Mutual Information (SMI) between the CellTypist probability matrix (cells × cell types) and the DRVI factor activity matrix (cells × factors) to identify which factors correspond to which cell types.
 #
 # **Skip this section if no CellTypist model matches your tissue.**
 #
@@ -690,7 +675,8 @@ display(ct_significant.sort_values("smi", ascending=False))
 # known marker gene profiles for specific cell types.
 #
 # This is complementary to CellTypist (which classifies cells using expression matrices) and LLM tools
-# (which reason over gene lists). This method tests whether a factor's top genes significantly overlap with curated marker sets — no API key or pretrained model required.
+# (which reason over gene lists). This method tests, via enrichment, whether a factor's top genes
+# significantly overlap with curated marker sets — no API key or pretrained model required.
 
 # %%
 import blitzgsea as blitz
@@ -749,10 +735,10 @@ display(celltype_ora_results.sort_values(["factor", "FDR"]))
 # - **Input**: Unordered gene list (top-N genes by DRVI effect score per factor-direction) and optional tissue context
 # - **Algorithm**: Sends the gene list and tissue information to the configured LLM via a structured prompt asking "what cell type do these marker genes represent?" The LLM performs zero-shot semantic matching against its training knowledge of gene–cell type associations
 # - **Output**: A single cell type label or a biological process label as a plain text string
-# - **LLM backend**: Provider-agnostic — supports Google Gemini, OpenAI, Anthropic, AWS Bedrock, Azure OpenAI, Azure ML endpoints, Cohere, HuggingFace, Vertex AI, Ollama and others via a single `configure_llm_backend()` call. For further information on how to implement your desired LLM provider an model please check out [AnnDictionary](https://github.com/ggit12/anndictionary).
+# - **LLM backend**: Provider-agnostic — supports Google Gemini, OpenAI, Anthropic, AWS Bedrock, Azure OpenAI, Azure ML endpoints, Cohere, HuggingFace, Vertex AI, Ollama and others via a single `configure_llm_backend()` call. For further information on how to implement your desired LLM provider an model please checkout [AnnDictionary](https://github.com/ggit12/anndictionary).
 #
 # AnnDictionary does not provide a confidence score natively. 
-# We use AnnDictionary here with the open-source and free resource Ollama. 
+# We use AnnDictionary here with the open source and free resource Ollama. 
 
 # %%
 import anndict as adic
@@ -794,26 +780,29 @@ df_anndictionary
 # %% [markdown]
 # ### 1.5 CASSIA
 #
-# [CASSIA](https://github.com/ElliotXie/CASSIA) ([Nature Comms 2025](https://www.nature.com/articles/s41467-025-67084-x)) is a multi-agent LLM system for automated, interpretable cell type annotation. It uses dedicated agents for annotation, validation, formatting, quality scoring, and reporting.
+# [CASSIA](https://github.com/ElliotXie/CASSIA) (`pip install CASSIA`, [Nature Comms 2025](https://www.nature.com/articles/s41467-025-67084-x)) is a multi-agent LLM system for automated, interpretable cell type annotation. It uses dedicated agents for annotation, validation, formatting, quality scoring, and reporting. 
 #
-# - **Input**: Marker genes, species, tissue context, LLM model
+# - **Input**: Marker genes, species, tissue context, LLM-Model
 # - **Algorithm**:
-#   1. *Annotation agent*: Proposes cell type labels with detailed biological reasoning based on marker gene expression patterns, using a zero-shot chain-of-thought approach that mimics the workflow a computational biologist would follow
-#   2. *Validation agent*: Iteratively checks annotations for consistency in marker–cell type alignment
-#   3. *Formatting agent*: Summarizes each cell annotation
-#   4. *Quality scoring agent*: Assigns a quality score (0–100) based on scientific accuracy and marker balance
-#   5. *Reporter agent*: Provides full interpretability with detailed reasoning, quality scores, and refinements
-#   6. *Optional agents*:
-#     - *Annotation Boost*: Improves low-scoring annotations
-#     - *Subclustering*: Resolves mixed cell populations with subtle phenotypic differences
-#     - *RAG (retrieval-augmented generation)*: Integrates external knowledge from databases like CellMarker and ontologies
-#     - *Uncertainty Quantification*
-# - **Output**: Cell type annotation with **quality score (0–100)**, detailed biological reasoning trace, and HTML report with evidence documentation
+#   1. *Annotation agent*: Proposes cell type labels with detailed biological reasoning based on marker gene expression pattern: using a zero-shot chain-of-thought approach that mimics the standard workflow that a computational biologist would typically follow for cell annotation
+#   2. *Validation agent*: Iteratively checks annoations for consistency in marker-cell type alignment 
+#   3. *Formatting agent*: summarizes each cell annotation
+#   4. *Quality scoring agent*: Assigns a quality score (0–100) to each annotation based on scientific accuracy and marker balance
+#   5. *Reporter agent*: Provides full interpretatbility with detailed resoning, quality scores, and refinements
+#   4. *Optional agents*: 
+#     a. *Annotation Boost*: imprves low-scoring annotations
+#     b. *Subclustering*: resolves mixed cell populations with sublte phenotypic differences
+#     c. *RAG (retrieval-augmented generation)*: integrates external knowledge from databases like CellMarker and ontologies
+#     d. *Uncertainty Quantification*:
+# - **Output**:
+#   - Cell type annotation with **quality score (0–100)** 
+#   - Detailed biological reasoning trace
+#   - HTML report with evidence documentation
 # - **Supported providers**: OpenAI, Anthropic, OpenRouter (including free open-source models via OpenRouter)
 #
 # CASSIA is MIT-licensed (commercial-friendly) and provides a [web UI](https://www.cassia.bio/) for interactive use.
 #
-# *Recommended API KEY: `OPENROUTER_API_KEY`.* We use Ollama for this tutorial. For further information on other models, check out [CASSIA](https://github.com/ElliotXie/CASSIA).
+# *Recommended API KEY: `OPENROUTER_API_KEY`.*   We are using Ollama for this tutorial. For further information on the selection and implementation of other models please go checkout [CASSIA](https://github.com/ElliotXie/CASSIA).
 
 # %%
 import CASSIA
@@ -902,24 +891,28 @@ print(f"Loaded {gsea_db}: {len(signature_lib)} gene sets")
 # %%
 blitzgsea_rows = []
 
-for fac, factor_label, sign, series in iter_factor_directions():
-    # BlitzGSEA expects a DataFrame with columns "i" (gene) and "v" (score)
-    signature = series.rename("v").reset_index().rename(columns={"index": "i"})
-    signature["v"] = pd.to_numeric(signature["v"], errors="coerce")
-    signature = signature.replace([np.inf, -np.inf], np.nan).dropna(subset=["v"])
+for fac in factor_ids:
+    for fac, factor_label, sign, series in iter_factor_directions():
+        # BlitzGSEA expects a DataFrame with columns "i" (gene) and "v" (score)
+        signature = series.rename("v").reset_index().rename(columns={"index": "i"})
+        signature["v"] = pd.to_numeric(signature["v"], errors="coerce")
+        signature = signature.replace([np.inf, -np.inf], np.nan).dropna(subset=["v"])
 
-    try:
-        res = blitz.gsea(signature, signature_lib, processes=4)
-        sig = res[res["fdr"] < significance_threshold].sort_values("fdr")
-        for term, row in sig.head(3).iterrows():
-            blitzgsea_rows.append({
-                "factor": factor_label,
-                "term": term,
-                "NES": round(float(row["nes"]), 3),
-                "FDR": float(row["fdr"]),
-            })
-    except Exception as e:
-        print(f"BlitzGSEA failed for {factor_label}: {e}")
+        try:
+            res = blitz.gsea(signature, signature_lib, processes=4)
+            sig = res[res["fdr"] < significance_threshold].sort_values("fdr")
+            if len(sig):
+                # Keep up to the top 3 most significant terms per factor-direction
+                top_sig = sig.head(3)
+                for term, row in top_sig.iterrows():
+                    blitzgsea_rows.append({
+                        "factor": factor_label,
+                        "term": term,
+                        "NES": round(float(row["nes"]), 3),
+                        "FDR": float(row["fdr"]),
+                    })
+        except Exception as e:
+            print(f"BlitzGSEA failed for {factor_label}: {e}")
 
 blitzgsea_results = pd.DataFrame(blitzgsea_rows)
 
@@ -1233,7 +1226,7 @@ combined_std = pd.concat([pos_T, neg_T], axis=0)
 decoupler_all = run_decouple(combined_std)
 
 decoupler_results = (
-    decoupler_all[decoupler_all["p_adj"] < significance_threshold]
+    decoupler_all[decoupler_all["p_adj"] < fdr_threshold]
     .sort_values("p_adj")
     .groupby("factor", as_index=False)
     .first()
@@ -1313,20 +1306,20 @@ def run_gs2txt(pos_ranked, neg_ranked):
 # %%
 gs2txt_results = run_gs2txt(pos_ranked, neg_ranked)
 with pd.option_context("display.max_colwidth", None):
-    display(gs2txt_results)
+    display(gs2txt_results[...])
 
 # %% [markdown]
-# ## 3. Curation Table and Export
+# ## 3. Summary
 
 # %% [markdown]
 # ### 3.1 Curation Table 
 #
-# This is the final deliverable of the tutorial. We merge evidence from all tools into a single table where each row is one factor-direction. The table includes the top hits from each tool (when significant) and the top 10 genes, helping you to assign a biological label.
+# We now merge evidence from all tools into a single curation table. Each row represents one factor-direction, with the top hits from each tool (if significant) shown in a compact format. The table also includes the top 10 genes driving each factor-direction to facilitate manual validation via literature or LLMs.
 #
-# **Recommended workflow:**
-# 1. Run the cells below to build the table and export a CSV.
+# **Recommended workflow (code-based labeling):**
+# 1. Run the curation cells below to build the table and export a CSV template.
 # 2. Edit `MANUAL_LABELS` in the helper cell to define your final annotations per factor-direction.
-# 3. Re-run the curation and export cells to update the CSV.
+# 3. Re-run the curation and export cells to refresh the CSV with your labels.
 # 4. Run the re-import cell to store final annotations in the embedding object.
 #
 
@@ -1354,8 +1347,6 @@ curation = pd.DataFrame(curation_rows)
 
 # ─── Helper to build a column from grouped results ───────────────────────────
 def build_column(df, factor_col, sort_col, top_n, fmt_fn):
-    if df is None or df.empty:
-        return pd.Series("", index=curation.index)
     mapping = {}
     for fac, grp in df.sort_values(sort_col).groupby(factor_col):
         top = grp.head(top_n)
@@ -1364,7 +1355,7 @@ def build_column(df, factor_col, sort_col, top_n, fmt_fn):
 
 # ─── 1.1 Known annotation SMI ────────────────────────────────────────────────
 known_map = {}
-if "smi_top_matches" in dir() and len(smi_top_matches):
+if len(smi_top_matches):
     for fac, grp in smi_top_matches.sort_values("value", ascending=False).groupby("title"):
         row = grp.head(CURATION_TOP_N["known_annotation"]).iloc[0]
         known_map[fac] = f"{row['variable']} || SMI={row['value']:.2f}"
@@ -1372,89 +1363,62 @@ curation["known_annotation"] = curation["factor"].map(known_map).fillna("")
 
 # ─── 1.2 CellTypist SMI ──────────────────────────────────────────────────────
 ct_map = {}
-if "ct_significant" in dir() and len(ct_significant):
+if len(ct_significant):
     for _, row in ct_significant.iterrows():
         ct_map[row["factor"]] = f"{row['cell_type']} || SMI={row['smi']:.2f}"
 curation["celltypist"] = curation["factor"].map(ct_map).fillna("")
 
 # ─── 1.3 Cell Type ORA ───────────────────────────────────────────────────────
 curation["celltype_ora"] = build_column(
-    celltype_ora_results if "celltype_ora_results" in dir() else None,
-    "factor", "FDR", CURATION_TOP_N["celltype_ora"],
+    celltype_ora_results, "factor", "FDR", CURATION_TOP_N["celltype_ora"],
     lambda r: f"{r['cell_type']} ({r['database']}) || NES={r['NES']:.2f} || FDR={r['FDR']:.2e}"
 )
 
 # ─── 2.1 BlitzGSEA ───────────────────────────────────────────────────────────
 curation["blitzgsea"] = build_column(
-    blitzgsea_results if "blitzgsea_results" in dir() else None,
-    "factor", "FDR", CURATION_TOP_N["blitzgsea"],
+    blitzgsea_results, "factor", "FDR", CURATION_TOP_N["blitzgsea"],
     lambda r: f"{r['term']} || NES={r['NES']:.2f} || FDR={r['FDR']:.2e}"
 )
 
 # ─── 2.2 GSEApy prerank ──────────────────────────────────────────────────────
 curation["gseapy_prerank"] = build_column(
-    gseapy_results if "gseapy_results" in dir() else None,
-    "factor", "FDR", CURATION_TOP_N["gseapy_prerank"],
+    gseapy_results, "factor", "FDR", CURATION_TOP_N["gseapy_prerank"],
     lambda r: f"{r['term']} || NES={r['NES']:.2f} || FDR={r['FDR']:.2e}"
 )
 
 # ─── 2.2 GSEApy enrichr ORA ──────────────────────────────────────────────────
 curation["gseapy_enrichr"] = build_column(
-    enrichr_results if "enrichr_results" in dir() else None,
-    "factor", "p_adj", CURATION_TOP_N["gseapy_enrichr"],
+    enrichr_results, "factor", "p_adj", CURATION_TOP_N["gseapy_enrichr"],
     lambda r: f"{r['term']} || p_adj={r['p_adj']:.2e}"
 )
 
 # ─── 2.3 g:Profiler ──────────────────────────────────────────────────────────
-sig_gp = (
-    gprofiler_all[gprofiler_all["p_value"] < significance_threshold].copy()
-    if "gprofiler_all" in dir() and not gprofiler_all.empty else pd.DataFrame()
-)
+sig_gp = gprofiler_all[gprofiler_all["p_value"] < fdr_threshold].copy()
 curation["gprofiler"] = build_column(
     sig_gp, "factor", "p_value", CURATION_TOP_N["gprofiler"],
     lambda r: f"{r['name']} || p={r['p_value']:.2e}"
 )
 
 # ─── 2.4 decoupler ───────────────────────────────────────────────────────────
-dc_sig = (
-    decoupler_all[decoupler_all["p_adj"] < significance_threshold]
-    if "decoupler_all" in dir() else pd.DataFrame()
-)
+dc_sig = decoupler_all[decoupler_all["p_adj"] < fdr_threshold]
 curation["decoupler"] = build_column(
     dc_sig, "factor", "p_adj", CURATION_TOP_N["decoupler"],
     lambda r: f"{r['term']} || p_adj={r['p_adj']:.2e}"
 )
-
 # ─── LLM cell type (AnnDictionary + CASSIA) ──────────────────────────────────
-anndict_ct = (
-    {f"{r['Factor_ID']}{r['Direction']}": r["Predicted_Celltype"]
-     for _, r in df_anndictionary.iterrows() if r["Predicted_Celltype"]}
-    if "df_anndictionary" in dir() else {}
-)
-curation["anndictionary_celltype"] = curation["factor"].map(anndict_ct).fillna("")
-
-if "cassia_results" in dir():
-    cassia_general = {f"{r['Factor_ID']}{r['Direction']}": r["Predicted_General"]
-                      for _, r in cassia_results.iterrows() if pd.notna(r["Predicted_General"])}
-    cassia_detailed = {f"{r['Factor_ID']}{r['Direction']}": r["Predicted_Detailed"]
-                       for _, r in cassia_results.iterrows() if pd.notna(r["Predicted_Detailed"])}
-else:
-    cassia_general, cassia_detailed = {}, {}
-
-curation["cassia_general"] = curation["factor"].map(cassia_general).fillna("")
-curation["cassia_detailed"] = curation["factor"].map(cassia_detailed).fillna("")
+anndict_ct = {f"{r['Factor_ID']}{r['Direction']}": f"AnnDict: {r['Predicted_Celltype']}"
+             for _, r in df_anndictionary.iterrows() if r["Predicted_Celltype"]}
+cassia_ct = {f"{r['Factor_ID']}{r['Direction']}": f"CASSIA: {r['Predicted_Process']}"
+            for _, r in cassia_results.iterrows() if r["Predicted_Process"]}
+curation["llm_celltype"] = curation["factor"].map(
+    lambda f: " | ".join(filter(None, [anndict_ct.get(f), cassia_ct.get(f)]))
+).replace("", pd.NA).fillna("")
 
 # ─── LLM biological process (AnnDictionary + gs2txt) ─────────────────────────
-anndict_bp = (
-    {f"{r['Factor_ID']}{r['Direction']}": f"AnnDict: {r['Predicted_Process']}"
-     for _, r in df_anndictionary.iterrows() if r["Predicted_Process"]}
-    if "df_anndictionary" in dir() else {}
-)
-gs2txt_bp = (
-    {f"{r['Factor_ID']}{r['Direction']}": f"gs2txt: {r['Predicted_Process']}"
-     for _, r in gs2txt_results.iterrows() if r["Predicted_Process"]}
-    if "gs2txt_results" in dir() else {}
-)
+anndict_bp = {f"{r['Factor_ID']}{r['Direction']}": f"AnnDict: {r['Predicted_Process']}"
+              for _, r in df_anndictionary.iterrows() if r["Predicted_Process"]}
+gs2txt_bp = {f"{r['Factor_ID']}{r['Direction']}": f"gs2txt: {r['Predicted_Process']}"
+             for _, r in gs2txt_results.iterrows() if r["Predicted_Process"]}
 curation["llm_bioprocess"] = curation["factor"].map(
     lambda f: " | ".join(filter(None, [anndict_bp.get(f), gs2txt_bp.get(f)]))
 ).replace("", pd.NA).fillna("")
@@ -1504,13 +1468,19 @@ def set_label(factor, label, notes=None):
 # %%
 curation_edited = pd.read_csv(curation_path)
 
-# Apply manual labels from MANUAL_LABELS (overrides any CSV edits)
-curation_edited["manual_label"] = curation_edited["factor"].map(MANUAL_LABELS).fillna("")
+# Apply manual labels from MANUAL_LABELS at import time (overrides any CSV edits)
+curation_edited["manual_label"] = curation_edited["factor"].map(lambda f: MANUAL_LABELS.get(f, ""))
 
-curation_edited["final_label"] = curation_edited["manual_label"].str.strip()
-curation_edited["label_source"] = curation_edited["final_label"].apply(
-    lambda x: "manual" if x else "none"
-)
+
+def pick_final_label(row):
+    """Pick final annotation: use only the manual label if provided."""
+    if pd.notna(row.get("manual_label")) and str(row["manual_label"]).strip():
+        return str(row["manual_label"]).strip(), "manual"
+    return "", "none"
+
+labels_and_sources = curation_edited.apply(pick_final_label, axis=1, result_type="expand")
+curation_edited["final_label"] = labels_and_sources[0]
+curation_edited["label_source"] = labels_and_sources[1]
 
 display(curation_edited[["factor", "final_label", "label_source"]].head(20))
 
