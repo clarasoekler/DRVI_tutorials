@@ -8,32 +8,24 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.1
 #   kernelspec:
-#     display_name: UV on drvi tutorials
+#     display_name: python_apptainer
 #     language: python
-#     name: drvi_t
+#     name: python_apptainer
 # ---
 
 # %% [markdown]
 # # Identification of factors
 
 # %% [markdown]
-# QUESTIONS: Heatmaps: Both plot_latent_dims_in_heatmap calls (Celltypist and available annotations) still use embed, so the heatmaps show one row per factor (no separate +/− rows). 
-
-# %% [markdown]
-# In this notebook, we use the already trained DRVI model on the immune dataset to identify biological processes captured by each latent factor. We combine multiple complementary annotation strategies:
+# In this notebook, we use some supervised information and enrichment tools on an already trained DRVI model on the immune dataset to identify biological processes captured by latent factors. We combine multiple complementary strategies:
 #
-# 1. **Cell type annotation** — match factors to known cell types using existing labels (SMI) and pre-trained classifiers (CellTypist)
-# 2. **Annotation of Biological Processes** using
-#     * a. **Gene set enrichment analysis (GSEA)** — identify enriched pathways from ranked gene lists (BlitzGSEA)
-#     * b. **Over-representation analysis (ORA)** — test for enriched gene sets using ordered queries (g:Profiler)
-#     * c. **Regulator activity inference** — infer transcription factor or pathway activity using a statistical framework (decoupler) integrated with prior knowledge 
-#
-# Each tool operates on the gene-level interpretability scores produced by DRVI's built-in scoring API (`model.get_interpretability_scores`). DRVI provides two complementary scoring approaches that can be selected via the `INTERPRETABILITY_MODE` config variable:
-#
-# - **OOD (Out-of-Distribution)**: Uses decoder reconstructions to calculate per-gene effect scores. This is our suggested method to consider for finding cell-types and most specific genes of a program.
-# - **IND (Within-Distribution)**: Iterates over all cells to compute weighted mean effects. Captures broader mechanistic effects including shared genes.
-#
-# All tools in this notebook are **guiding tools**: they summarize large gene-level patterns into interpretable scores, but they do **not** provide definitive labels. Their outputs should always be interpreted in context, compared across methods, and validated against known biology and the original data.
+# 1. **Cell type annotation** — match factors to known cell types. For that you can use:
+#     * Existing labels
+#     * Pre-trained classifiers (e.g. CellTypist)
+# 3. **Annotation of Biological Processes** using
+#     * **Gene set enrichment analysis (GSEA)** — identify enriched pathways from ranked gene lists (BlitzGSEA)
+#     * **Over-representation analysis (ORA)** — test for enriched gene sets using ordered queries (g:Profiler)
+#     * **Regulator activity inference** — infer transcription factor or pathway activity using a statistical framework (decoupler) integrated with prior knowledge 
 #
 # **We always advise examination by a biologist and validation against published literature for any identified processes.**
 
@@ -47,64 +39,52 @@
 # While we use the immune dataset as a running example, all code is dataset-agnostic. Configuration variables at the top of each section indicate what to change for your own data.
 
 # %% [markdown]
+# ### Adapting this notebook to your own dataset
+#
+# To reuse this notebook on a different dataset or DRVI model:
+#
+# - Update the `0. Load a previously trained model` section accorfingly.
+#   - Update `io_dir` to point to your project directory.
+#   - Make sure the following files exist under `io_dir` with your data (or change the code):
+#     - `immune_all.h5ad` (or your equivalent full-gene data) in the parent directory.
+#     - `adata_preprocesses.h5ad` (preprocessed AnnData with HVGs and UMAP)
+#     - `drvi_model/` (trained DRVI model directory)
+#     - `embed.h5ad`
+#
+# ### Config Overview
+# - The notebook contains 5 independent ways to annotate processes. Each having its own config. Some important configs are:
+#   - **Section 1.1** For identification based on user annotations you have to set `annot_col` to the corresponding column in `adata.obs`.
+#   - **Section 1.2** For identification based on a pre-trained model. If you use CellTypist you have to choose a model via `ct_model` that matches your tissue / species (e.g. `"Immune_All_Low.pkl"` for PBMC, `"Developing_Mouse_Brain.pkl"` for mouse brain)
+#   - **Section 2.1** For BlitzGSEA, set:
+#     - `gsea_db` (e.g `"GO_Biological_Process_2023"`)
+#     - `fdr_threshold` to keep significant results.
+#   - **Section 2.2** For g:Profiler, set:
+#     - `organism` (e.g. `"hsapiens"`, `"mmusculus"`).
+#     - `gp_source` to the GO / pathway collections you care about (e.g. `["GO:BP"]`, `["REAC"]`).
+#     - `pval_threshold` to keep significant results.
+#   - **Section 2.3** For decoupler, set:
+#     - `dc_geneset` (e.g. `"collectri"`, `"dorothea"`, `"progeny"` or another resource name).
+#     - `dc_organism` to match your species (e.g. `"human"`, `"mouse"`).
+#     - `fdr_threshold` to keep significant results.
+#
+
+# %% [markdown]
+# ## Requirements
+#
+# This notebook requires the following python packages:
+# ```
+# celltypist
+# blitzgsea
+# gprofiler-official
+# decoupler
+# ```
+
+# %% [markdown]
 # ## Contact
 #
 # For questions and help requests, you can reach out in the [scverse discourse](https://discourse.scverse.org/).
 #
 # If you found a bug, please use the [issue tracker](https://github.com/theislab/drvi/issues).
-
-# %% [markdown]
-# ## Adapting this notebook to your own dataset
-#
-# To reuse this notebook on a different dataset or DRVI model, check and update the following items:
-#
-# - **1. File paths and IO**
-#   - Update `io_dir` to point to your project directory.
-#   - Make sure the following files exist under `io_dir` with your data:
-#     - `adata_preprocesses.h5ad` (preprocessed AnnData with HVGs and UMAP)
-#     - `drvi_model/` (trained DRVI model directory)
-#     - `embed.h5ad` 
-#     - Optionally: `immune_all.h5ad` (or your equivalent full-gene data) for defining `all_genes`.
-#
-# - **2. Interpretability mode**
-#   - Set `INTERPRETABILITY_MODE` in the Config cell to `"OOD"` (out-of-distribution, default) or `"IND"` (within-distribution).
-#   - Both score sets must have been computed in the general pipeline via `model.calculate_interpretability_scores(embed, "OOD")` and `model.calculate_interpretability_scores(embed, "IND")`.
-#
-# - **3. Cell-level annotations (optional but recommended)**
-#   - If you have cell-type labels, set `annot_col` to the corresponding column in `adata.obs`
-#     (e.g. `"final_annotation"`).
-#   - If you do **not** have annotations, set `annot_col = None` and skip:
-#     - Section 1.1 (SMI with known annotations)
-#     - Section 5 (visual validation on UMAP).
-#
-# - **4. Species and gene-sets**
-#   - For BlitzGSEA, set:
-#     - `gsea_db` (e.g `"GO_Biological_Process_2023"`)
-#   - For g:Profiler, set:
-#     - `organism` (e.g. `"hsapiens"`, `"mmusculus"`).
-#     - `gp_source` to the GO / pathway collections you care about (e.g. `["GO:BP"]`, `["REAC"]`).
-#   - For decoupler, set:
-#     - `dc_geneset` (e.g. `"collectri"`, `"dorothea"`, `"progeny"` or another resource name).
-#     - `dc_organism` to match your species (e.g. `"human"`, `"mouse"`).
-#   - For non-human species, check that your gene-set resources and all_genes use the same gene-name casing; you may need to remove .str.upper() when working with mouse.
-#
-# - **5. CellTypist (optional)**
-#   - Choose a model via `ct_model` that matches your tissue / species
-#     (e.g. `"Immune_All_Low.pkl"` for PBMC, `"Developing_Mouse_Brain.pkl"` for mouse brain).
-#   - If no suitable model exists, skip the CellTypist section and rely on your own annotations
-#     plus the enrichment / decoupler tools using celltype databases.
-#
-# - **6. Significance thresholds**
-#   - `fdr_threshold` controls:
-#     - FDR cutoffs for BlitzGSEA and decoupler.
-#     - The g:SCS-corrected p-value cutoff in g:Profiler (treated analogously to an FDR threshold).
-#
-# - **7. Manual curation**
-#   - Use the exported `factor_annotation_curation.csv` as your central place to:
-#     - Inspect top genes and tool suggestions per factor-direction.
-#     - Define `MANUAL_LABELS` and `MANUAL_NOTES` in the helper cell.
-#   - Re-import the curated CSV and re-run the final cells to store
-#     `embed.var["annotation_final"]` and `embed.var["annotation_source"]` with your labels.
 
 # %% [markdown]
 # ## Install
@@ -163,45 +143,32 @@ plt.rcParams["figure.dpi"] = 100
 plt.rcParams["figure.figsize"] = (3, 3)
 
 # %% [markdown]
-# ## Config
+# ## 0. Load a previously trained model
+
+# %% [markdown]
+# ### Config
 
 # %%
 # Set input output directory
 # We use tmp_io/ directory in the same place as this notebook. Update accordingly.
-io_dir = Path("/home/icb/clara.sanchez/data/drvi_immune_128")
-
-# ---------------------------------------------------------------------------
-# Interpretability method
-# ---------------------------------------------------------------------------
-# "OOD" — Out-of-distribution: uses decoder reconstructions (faster, default)
-# "IND" — Within-distribution: iterates over all cells (captures broader effects)
-INTERPRETABILITY_MODE = "OOD"
-
-_SCORE_KEY_MAP = {
-    "OOD": "OOD_combined",
-    "IND": "IND_linear_weighted_mean",
-}
-assert INTERPRETABILITY_MODE in _SCORE_KEY_MAP, (
-    f"Invalid INTERPRETABILITY_MODE={INTERPRETABILITY_MODE!r}. Choose 'OOD' or 'IND'."
-)
-score_key = _SCORE_KEY_MAP[INTERPRETABILITY_MODE]
-print(f"Interpretability mode: {INTERPRETABILITY_MODE} (score_key={score_key!r})")
-
-# Global significance threshold used across all tools.
-# Note: for BlitzGSEA and decoupler this is an FDR cutoff, while for g:Profiler
-# it is applied to g:SCS-corrected p-values (not classical FDR).
-fdr_threshold = 0.05
+io_dir = Path("./tmp_io/drvi_immune_128").resolve()
+print(f"Using directory: {io_dir}")
 
 # %% [markdown]
-# ## Load Data
+# ### Load Data
 
 # %%
-# Update this path to point to your project directory
+raw_data_path = io_dir.parent / "immune_all.h5ad"
+adata_full = sc.read_h5ad(raw_data_path)
+adata_full
+
+# %%
+# The adata which DRVI model is trained on (HVG selected)
 adata = sc.read_h5ad(io_dir / "adata_preprocesses.h5ad")
 adata
 
 # %% [markdown]
-# ## Load DRVI outputs
+# ### Load DRVI outputs
 
 # %%
 model_path = io_dir / "drvi_model"
@@ -212,108 +179,18 @@ model = DRVI.load(model_path, adata)
 embed = sc.read_h5ad(embed_path)
 
 # %% [markdown]
-# ## 0. Prepare shared inputs
-#
-# All annotation tools operate on the gene-level interpretability scores computed by DRVI. For each latent factor, the positive (+) and negative (−) direction each produce a vector of per-gene scores that quantify how much each gene's predicted expression changes. These scores serve as:
-#
-# - **Ranked gene lists** for GSEA-style tools (BlitzGSEA)
-# - **Ordered gene queries** for ORA-style tools (g:Profiler)
-# - **Gene × factor score matrices** for decoupler which uses statistical models (like ULM or MLR) to infer regulator activity by integrating these scores with a prior knowledge network
-#
-# The scoring approach is controlled by `INTERPRETABILITY_MODE` (set in Config above):
-# - **OOD** scores emphasize factor-specific genes via decoder reconstructions.
-# - **IND** scores capture broader mechanistic effects by averaging over all cells.
-#
-# We prepare these shared inputs once and reuse them across all tools.
-
-# %%
-# Remove vanished dimensions
-embed_nv = embed[:, ~embed.var["vanished"].astype(bool)].copy()
-factor_ids = embed_nv.var["title"].astype(str).tolist()
-print(f"Active (non-vanished) factors: {embed_nv.n_vars}")
-
-# Get gene-level interpretability scores via the DRVI model API.
-# Returns a DataFrame of shape (n_genes, 2*n_factors): one column per factor-direction.
-scores_df = model.get_interpretability_scores(embed, adata, key=score_key)
-print(f"Scores shape: {scores_df.shape}  (genes x factor-directions)")
-
-# Split into positive (+) and negative (-) direction DataFrames, filtered to non-vanished factors.
-# Strip the +/- suffix so column names match factor_ids for downstream tools.
-pos_cols = [f"{fid}+" for fid in factor_ids]
-neg_cols = [f"{fid}-" for fid in factor_ids]
-pos_df = scores_df[pos_cols].rename(columns=lambda c: c[:-1])
-neg_df = scores_df[neg_cols].rename(columns=lambda c: c[:-1])
-
-# Background gene universe: all genes measured in the experiment (before HVG filtering).
-raw_data_path = io_dir / "immune_all.h5ad"
-adata_full = sc.read_h5ad(raw_data_path, backed="r")
-
-# NOTE: We uppercase gene names here, which is appropriate for human (HUGO symbols),
-# but will break standard mouse Gene Symbols (e.g., "Cd4" -> "CD4").
-# If you work with mouse or another species where case matters, remove `.str.upper()`
-# and make sure your gene set resources use the same casing as your data.
-all_genes = adata_full.var_names.astype(str).str.strip().str.upper()
-adata_full.file.close()
-all_genes = pd.Index(all_genes).drop_duplicates().tolist()
-print(f"Background genes: {len(all_genes)}")
-
-
-# %%
-def build_inputs(df, all_genes=all_genes):
-    """Build enrichment inputs from a genes x factors score matrix.
-
-    Returns
-    -------
-    std : DataFrame
-        Standardized genes x factors scores (uppercased, duplicates merged by max).
-    ranked : dict
-        {factor: Series sorted by descending score} for GSEA tools.
-    """
-    std = df.copy()
-    std.index = std.index.astype(str).str.strip().str.upper()
-    std = std.groupby(std.index).max()
-
-    if all_genes is not None:
-        idx = pd.Index(pd.Series(all_genes).astype(str)).drop_duplicates()
-        std = std.reindex(idx)
-
-    ranked = {c: std[c].dropna().sort_values(ascending=False) for c in std.columns}
-    return std, ranked
-
-
-pos_std, pos_ranked = build_inputs(pos_df)
-neg_std, neg_ranked = build_inputs(neg_df)
-
-# Factor-direction labels used throughout (e.g., "DR 36+")
-factor_dir_labels = [f"{f}+" for f in factor_ids] + [f"{f}-" for f in factor_ids]
-
-print(f"Factors: {len(factor_ids)}")
-print(f"Factor-directions: {len(factor_dir_labels)}")
-print(f"Genes per ranked list: {len(next(iter(pos_ranked.values())))}")
-
-# %% [markdown]
-# ## 1. Cell type annotation
+# ## 1. Identifying Cell-Type Specific Processes
 #
 # Some latent factors capture cell-type identity. We can identify these using:
-# - **Known annotations** (if available): measure alignment between factors and annotated cell types via Scaled Mutual Information (SMI)
-# - **CellTypist**: classify cells using pre-trained models and correlate class probabilities with factor activities
-# - (Not described in this tutorial: using GSEA/ORA methods with Cell Type databases)
+# - **Known annotations**: This way we measure alignment between factors and annotated cell types via a similarity measurement like Scaled Mutual Information (SMI). We note that DRVI dimensions may be more fine grained than these annotations, resemble a process covering multiple cell types, or showing general shared processes. However, this approach allows identification of large proportion of processes. For this we need some supervised info such as:
+#   - **User annotations:** Where user has annotated its data.
+#   - **Annotation tools**: User can also use pre-trained models such as CellTypist or Foundational Models to classify cells.
+# - **Enrichment**: Using GSEA/ORA methods with Cell Type databases. This is not described in this tutorial in detail. but same models in **Biological Process Identification** section can be used.
 
 # %% [markdown]
-# #### Cell Type Annotation Config
-
-# %%
-# Column in adata.obs containing cell type labels. Set to None if not available.
-annot_col = "final_annotation" 
-
-smi_threshold = 0.5 # Minimum SMI score between factor and cell-type probability profiles to consider a factor as associated with a cell type. Adjust as needed.
-
-# %% [markdown]
-# ### 1.1 Known annotations (SMI)
+# ### 1.1 Identification based on user annotations
 #
 # If your dataset has existing cell type annotations, Scaled Mutual Information (SMI) measures how well each latent factor aligns with each annotated category. SMI is normalized to [0, 1], where 1 indicates perfect correspondence between a factor and a cell type.
-#
-# In this dataset we have annotations stored in `adata.obs["final_annotation"]`.
 #
 # **Skip this section if your dataset does not have cell type annotations.**
 
@@ -321,44 +198,21 @@ smi_threshold = 0.5 # Minimum SMI score between factor and cell-type probability
 # ####  Imports
 
 # %%
-import math
 import networkx as nx
 from drvi.utils.metrics import DiscreteDisentanglementBenchmark
 
 # %% [markdown]
-# #### Scaled Mutual Information
+# #### Config
+#
+# In this dataset we have annotations stored in `adata.obs["final_annotation"]`.
+#
 
 # %%
-# Compute SMI between each factor-direction (+/-) and each annotated cell type.
-titles = embed_nv.var["title"]
-combined_X = np.hstack([embed_nv.X, -embed_nv.X])
-combined_titles = [f"{t}+" for t in titles] + [f"{t}-" for t in titles]
+# Column in adata.obs containing cell type labels. Set to None if not available.
+annot_col = "final_annotation" 
 
-benchmark = DiscreteDisentanglementBenchmark(
-    combined_X,
-    dim_titles=combined_titles,
-    discrete_target=embed.obs[annot_col],
-    metrics=["SMI-disc"],
-    aggregation_methods=["LMS"],
-)
-benchmark.evaluate()
-smi_similarity = benchmark.get_results_details()["SMI-disc"]
-smi_similarity.index.name = "title"
-
-# %%
-print(f"SMI matrix shape: {smi_similarity.shape} (factor-directions x cell types)")
-display(smi_similarity.head())
-
-# %%
-# Reshape the SMI matrix from wide to long format, then keep only pairs above the threshold.
-smi_top_matches = (
-    smi_similarity.reset_index()
-    .melt(id_vars="title", value_vars=smi_similarity.columns)
-    .query("value >= @smi_threshold")
-    .reset_index(drop=True)
-)
-print(f"Factor–cell type pairs with SMI >= {smi_threshold}: {len(smi_top_matches)}")
-display(smi_top_matches.sort_values("value", ascending=False))
+# Minimum SMI score between factor and cell-type probability profiles to consider a factor as associated with a cell type. Adjust as needed.
+smi_threshold = 0.7
 
 # %% [markdown]
 # #### Visualize with a Heatmap
@@ -369,47 +223,87 @@ drvi.utils.pl.plot_latent_dims_in_heatmap(
     annot_col, 
     title_col="title", 
     sort_by_categorical=True,
-    figsize=(40, 16),
-    show=False,
 )
 
-fig = plt.gcf()
-for ax in fig.axes:
-    for label in ax.get_xticklabels():
-        label.set_fontsize(14)
-    for label in ax.get_yticklabels():
-        label.set_fontsize(14)
+# %% [markdown]
+# We observe very good one-to-one relationship between some factors and cell types. Let's identify them
 
-plt.tight_layout()
-plt.savefig("heatmap_large.png", dpi=150, bbox_inches="tight")
-plt.show()
+# %% [markdown]
+# #### Prepare data
+#
+# We prepare a matrix where columns are positive and negative nonvanished latent factors and rows are cells
+
+# %%
+embed_pos = embed[:, ~embed.var['vanished_positive_direction']].copy()
+embed_neg = embed[:, ~embed.var['vanished_negative_direction']].copy()
+embed_pos.var.index = embed_pos.var['title'] + '+'
+embed_neg.var.index = embed_neg.var['title'] + '-'
+embed_pos.X = embed_pos.X.clip(min=0)
+embed_neg.X = -embed_neg.X.clip(max=0)
+embed_directional_df = pd.concat([embed_pos.to_df(), embed_neg.to_df()], axis=1).loc[embed.obs.index]
+embed_directional_df[:3]
+
+# %% [markdown]
+# #### Calculation of Scaled Mutual Information
+#
+# We use `DiscreteDisentanglementBenchmark` class that we use for evaluation of models. This class calculated pairwise similarity function between latent factors and supervised targets.
+
+# %%
+# Compute SMI between each factor-direction (+/-) and each annotated cell type.
+benchmark = DiscreteDisentanglementBenchmark(
+    embed_directional_df.values,
+    dim_titles=embed_directional_df.columns,
+    discrete_target=embed.obs[annot_col],
+    metrics=["SMI-disc"],
+    aggregation_methods=[],
+)
+benchmark.evaluate()
+smi_similarity = benchmark.get_results_details()["SMI-disc"]
+smi_similarity.index.name = "title"
+
+# %%
+print(f"SMI matrix shape: {smi_similarity.shape} (factor-directions x cell types)")
+smi_similarity[:3]
+
+# %%
+# Reshape the SMI matrix from wide to long format, then keep only pairs above the threshold.
+smi_top_matches = (
+    smi_similarity.reset_index()
+    .melt(id_vars="title", value_vars=smi_similarity.columns)
+    .query("value >= @smi_threshold")
+    .reset_index(drop=True)
+    .sort_values("value", ascending=False)
+)
+print(f"Factor–cell type pairs with SMI >= {smi_threshold}: {len(smi_top_matches)}")
+smi_top_matches
 
 
 # %% [markdown]
-# #### Helper function for Plot Packed Network Visualization
+# #### Helper function for relationship Visualization
 
 # %%
-def plot_packed_network(df, title_col="title", var_col="variable", val_col="value"):
+def plot_packed_network(df, title_col="title", var_col="variable", val_col="value", figsize=(14, 10)):
     """Visualizes factor–cell type associations as a network with edge weights."""
     G = nx.from_pandas_edgelist(df, title_col, var_col, edge_attr=val_col)
 
     pos = {}
     components = sorted(nx.connected_components(G), key=len, reverse=True)
-    cols = math.ceil(len(components) ** 0.5)
+    cols = 3
     for i, nodes in enumerate(components):
         sub_pos = nx.spring_layout(G.subgraph(nodes), weight=val_col, k=0.5, seed=42)
         r, c = divmod(i, cols)
         for n, (x, y) in sub_pos.items():
             pos[n] = (x + c * 3, y - r * 3)
 
-    plt.figure(figsize=(14, 10))
+    plt.figure(figsize=figsize)
     titles = set(df[title_col])
+    weights = [d[val_col] for u, v, d in G.edges(data=True)]
     nx.draw(
         G, pos,
         with_labels=True, font_size=8, font_weight="bold", node_size=600,
         node_color=["#A0CBE2" if n in titles else "#FF9E9E" for n in G.nodes()],
-        width=[d[val_col] * 4 for u, v, d in G.edges(data=True)],
-        edge_color="grey", alpha=0.6,
+        width=[w * 4 for w in weights],
+        edge_color=weights, edge_cmap=plt.cm.Oranges, alpha=0.6,
     )
     edge_labels = {(u, v): f"{d[val_col]:.2f}" for u, v, d in G.edges(data=True)}
     nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
@@ -421,32 +315,73 @@ def plot_packed_network(df, title_col="title", var_col="variable", val_col="valu
 # #### Plot Packed Visualization
 
 # %%
-plot_packed_network(smi_top_matches)
+plot_packed_network(smi_top_matches, figsize=(20, 20))
 
 # %% [markdown]
-# ### 1.2 CellTypist
+# #### Store summary in var
+
+# %%
+first_match = smi_top_matches.drop_duplicates(subset=['title'])
+first_match['direction'] = first_match['title'].str[-1:]
+first_match['title'] = first_match['title'].str[:-1]
+first_match_pos = first_match.query("direction == '+'")
+first_match_neg = first_match.query("direction == '-'")
+embed.var.set_index("title", drop=False, inplace=True)
+embed.var[f'positive_direction_match_with_{annot_col}'] = None
+embed.var[f'negative_direction_match_with_{annot_col}'] = None
+embed.var[f'positive_direction_match_with_{annot_col}'][first_match_pos['title']] = first_match_pos['variable']
+embed.var[f'negative_direction_match_with_{annot_col}'][first_match_neg['title']] = first_match_neg['variable']
+embed.var.index = embed.var["original_dim_id"].astype(int).astype(str)
+embed.var.index.name = None
+
+(
+    embed.var[f'positive_direction_match_with_{annot_col}'].unique(),
+    embed.var[f'negative_direction_match_with_{annot_col}'].unique(),
+)
+
+# %% [markdown]
+# #### Store results in uns
+
+# %%
+embed.uns[f'best_smi_matching_{annot_col}_results'] = smi_top_matches
+
+# %%
+
+# %% [markdown]
+# ### 1.2 Identification based on pre-trained model
 #
-# [CellTypist](https://www.celltypist.org/) uses pre-trained logistic regression models trained on large-scale annotated atlases to classify individual cells. We calculate the Similarity Mutual Information (SMI) between the CellTypist probability matrix (cells × cell types) and the DRVI factor activity matrix (cells × factors) to identify which factors correspond to which cell types.
+# Here, we use [CellTypist](https://www.celltypist.org/) as a pre-trained logistic regression model trained on large-scale annotated atlases to classify individual cells. We calculate the Similarity Mutual Information (SMI) between the CellTypist probability matrix (cells × cell types) and the DRVI factor activity matrix (cells × factors) to identify which factors correspond to which cell types.
 #
-# **Skip this section if no CellTypist model matches your tissue.**
+# **Note 1: Users can skip this if they already have good annotations.**
 #
+# **Note 2: Only the annotation part is different from the previous section and everything is duplicate from `prepare data` section.**
 
 # %% [markdown]
 # #### Imports
 
 # %%
 import celltypist
-from celltypist import models
+import networkx as nx
+from drvi.utils.metrics import DiscreteDisentanglementBenchmark
 
 # %% [markdown]
-# #### CellTypist Model
+# #### Config
 
 # %%
+# Minimum SMI score between factor and cell-type probability profiles to consider a factor as associated with a cell type. Adjust as needed.
+smi_threshold = 0.7
+
+# We use "celltypist_majority" from cell typisy outputs
+annot_col = "celltypist_majority"
+
+# %%
+# CellTypist Model
+
 # Run celltypist.models.models_description() to see all available models. Choose one matching your tissue. 
 ct_model = "Immune_All_Low.pkl"  # e.g., "Developing_Mouse_Brain.pkl" for mouse brain
-models.download_models(force_update=False, model=ct_model)
+celltypist.models.download_models(force_update=False, model=ct_model)
 
-ct_model = models.Model.load(model=ct_model)
+ct_model = celltypist.models.Model.load(model=ct_model)
 # Run print(ct_model.cell_types) to see available cell types
 
 
@@ -457,90 +392,150 @@ ct_model = models.Model.load(model=ct_model)
 # Each cell receives a predicted label via logistic regression based on its transcriptomic profile. Setting majority_voting=True refines these labels by assigning the most frequent label within a cell's local neighborhood (kNN), reducing technical noise. The resulting per-cell labels are stored in adata.obs.
 
 # %%
-predictions = celltypist.annotate(adata, model=ct_model, majority_voting=True)
-adata.obs["celltypist_labels"] = predictions.predicted_labels["predicted_labels"]
-adata.obs["celltypist_majority"] = predictions.predicted_labels["majority_voting"]
+# We use full anndata (all genes) see Ce;;Typist docs for more info
+adata_full.X = adata_full.layers['counts'].copy()
+sc.pp.normalize_total(adata_full, target_sum=1e4)
+sc.pp.log1p(adata_full)
+
+predictions = celltypist.annotate(adata_full, model=ct_model, majority_voting=True)
+
+# %%
+embed.obs["celltypist_labels"] = predictions.predicted_labels["predicted_labels"].loc[embed.obs.index]
+embed.obs["celltypist_majority"] = predictions.predicted_labels["majority_voting"].loc[embed.obs.index]
+embed.obsm["celltypist_probs"] = predictions.probability_matrix[embed.obs["celltypist_majority"].cat.categories].loc[embed.obs.index]
 
 # %% [markdown]
-# #### Extract Probability Matrix
+# #### Visualize with a Heatmap
 
 # %%
-# Probability matrix: sigmoid-transformed decision scores (cells x cell types)
-prob_matrix = predictions.probability_matrix
-prob_matrix.index = adata.obs_names
-print(f"Probability matrix: {prob_matrix.shape[0]} cells x {prob_matrix.shape[1]} cell types")
-
-# %% [markdown]
-# #### CellTypist Mutual Information
-
-# %%
-# Compute SMI between each factor-direction and each CellTypist-predicted cell type.
-ct_titles = embed_nv.var["title"]
-ct_combined_X = np.hstack([embed_nv.X, -embed_nv.X])
-ct_combined_titles = [f"{t}+" for t in ct_titles] + [f"{t}-" for t in ct_titles]
-
-ct_benchmark = DiscreteDisentanglementBenchmark(
-    ct_combined_X,
-    dim_titles=ct_combined_titles,
-    discrete_target=adata.obs.loc[embed_nv.obs_names, "celltypist_majority"],
-    metrics=["SMI-disc"],
-    aggregation_methods=["LMS"],
-)
-ct_benchmark.evaluate()
-ct_smi_matrix = ct_benchmark.get_results_details()["SMI-disc"]
-ct_smi_matrix.index.name = "factor"
-print(f"CellTypist SMI matrix: {ct_smi_matrix.shape} (factor-directions x CellTypist labels)")
-
-# %%
-common_cells = adata.obs_names.intersection(embed.obs_names)
-embed = embed[common_cells].copy()
-adata = adata[common_cells].copy()
-
-embed.obs["celltypist_majority"] = (
-    adata.obs["celltypist_majority"]
-    .reindex(embed.obs_names)
-)
-
 drvi.utils.pl.plot_latent_dims_in_heatmap(
     embed, 
-    "celltypist_majority", 
+    annot_col, 
     title_col="title", 
     sort_by_categorical=True,
-    figsize=(40, 16),
-    show=False,  
 )
-
-fig = plt.gcf()
-for ax in fig.axes:
-    for label in ax.get_xticklabels():
-        label.set_fontsize(14)
-    for label in ax.get_yticklabels():
-        label.set_fontsize(14)
-
-plt.tight_layout()
-plt.savefig("heatmap_large.png", dpi=150, bbox_inches="tight")
-plt.show()
 
 # %% [markdown]
-# #### Summary Table
+# We observe very good one-to-one relationship between some factors and cell types. Let's identify them
+
+# %% [markdown]
+# #### Prepare data
+#
+# We prepare a matrix where columns are positive and negative nonvanished latent factors and rows are cells
 
 # %%
-# Top CellTypist match per factor-direction
-idx_name = ct_smi_matrix.index.name or "index"
-ct_long = (
-    ct_smi_matrix.reset_index()
-    .melt(id_vars=idx_name, var_name="cell_type", value_name="smi")
-    .rename(columns={idx_name: "factor"})
-    .sort_values("smi", ascending=False)
-    .drop_duplicates(subset="factor", keep="first")
+embed_pos = embed[:, ~embed.var['vanished_positive_direction']].copy()
+embed_neg = embed[:, ~embed.var['vanished_negative_direction']].copy()
+embed_pos.var.index = embed_pos.var['title'] + '+'
+embed_neg.var.index = embed_neg.var['title'] + '-'
+embed_pos.X = embed_pos.X.clip(min=0)
+embed_neg.X = -embed_neg.X.clip(max=0)
+embed_directional_df = pd.concat([embed_pos.to_df(), embed_neg.to_df()], axis=1).loc[embed.obs.index]
+embed_directional_df[:3]
+
+# %% [markdown]
+# #### Calculation of Scaled Mutual Information
+#
+# We use `DiscreteDisentanglementBenchmark` class that we use for evaluation of models. This class calculated pairwise similarity function between latent factors and supervised targets.
+
+# %%
+# Compute SMI between each factor-direction (+/-) and each cell type probability.
+benchmark = DiscreteDisentanglementBenchmark(
+    embed_directional_df.values,
+    dim_titles=embed_directional_df.columns,
+    discrete_target=embed.obs[annot_col],
+    metrics=["SMI-disc"],
+    aggregation_methods=[],
+)
+benchmark.evaluate()
+smi_similarity = benchmark.get_results_details()["SMI-disc"]
+smi_similarity.index.name = "title"
+
+# %%
+print(f"SMI matrix shape: {smi_similarity.shape} (factor-directions x cell types)")
+smi_similarity[:3]
+
+# %%
+# Reshape the SMI matrix from wide to long format, then keep only pairs above the threshold.
+smi_top_matches = (
+    smi_similarity.reset_index()
+    .melt(id_vars="title", value_vars=smi_similarity.columns)
+    .query("value >= @smi_threshold")
+    .reset_index(drop=True)
+    .sort_values("value", ascending=False)
+)
+print(f"Factor–cell type pairs with SMI >= {smi_threshold}: {len(smi_top_matches)}")
+smi_top_matches
+
+
+# %% [markdown]
+# #### Helper function for relationship Visualization
+
+# %%
+def plot_packed_network(df, title_col="title", var_col="variable", val_col="value", figsize=(14, 10)):
+    """Visualizes factor–cell type associations as a network with edge weights."""
+    G = nx.from_pandas_edgelist(df, title_col, var_col, edge_attr=val_col)
+
+    pos = {}
+    components = sorted(nx.connected_components(G), key=len, reverse=True)
+    cols = 3
+    for i, nodes in enumerate(components):
+        sub_pos = nx.spring_layout(G.subgraph(nodes), weight=val_col, k=0.5, seed=42)
+        r, c = divmod(i, cols)
+        for n, (x, y) in sub_pos.items():
+            pos[n] = (x + c * 3, y - r * 3)
+
+    plt.figure(figsize=figsize)
+    titles = set(df[title_col])
+    weights = [d[val_col] for u, v, d in G.edges(data=True)]
+    nx.draw(
+        G, pos,
+        with_labels=True, font_size=8, font_weight="bold", node_size=600,
+        node_color=["#A0CBE2" if n in titles else "#FF9E9E" for n in G.nodes()],
+        width=[w * 4 for w in weights],
+        edge_color=weights, edge_cmap=plt.cm.Oranges, alpha=0.6,
+    )
+    edge_labels = {(u, v): f"{d[val_col]:.2f}" for u, v, d in G.edges(data=True)}
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
+    plt.axis("off")
+    plt.show()
+
+
+# %% [markdown]
+# #### Plot Packed Visualization
+
+# %%
+plot_packed_network(smi_top_matches, figsize=(20, 20))
+
+# %% [markdown]
+# #### Store summary in var
+
+# %%
+first_match = smi_top_matches.drop_duplicates(subset=['title'])
+first_match['direction'] = first_match['title'].str[-1:]
+first_match['title'] = first_match['title'].str[:-1]
+first_match_pos = first_match.query("direction == '+'")
+first_match_neg = first_match.query("direction == '-'")
+embed.var.set_index("title", drop=False, inplace=True)
+embed.var[f'positive_direction_match_with_{annot_col}'] = None
+embed.var[f'negative_direction_match_with_{annot_col}'] = None
+embed.var[f'positive_direction_match_with_{annot_col}'][first_match_pos['title']] = first_match_pos['variable']
+embed.var[f'negative_direction_match_with_{annot_col}'][first_match_neg['title']] = first_match_neg['variable']
+embed.var.index = embed.var["original_dim_id"].astype(int).astype(str)
+embed.var.index.name = None
+
+(
+    embed.var[f'positive_direction_match_with_{annot_col}'].unique(),
+    embed.var[f'negative_direction_match_with_{annot_col}'].unique(),
 )
 
-ct_significant = ct_long.query("smi >= @smi_threshold").copy()
+# %% [markdown]
+# #### Store results in uns
 
-print(
-    f"CellTypist matches with SMI >= {smi_threshold}: "
-    f"{len(ct_significant)} / {len(ct_long)} factors"
-)
+# %%
+embed.uns[f'best_smi_matching_{annot_col}_results'] = smi_top_matches
+
+# %%
 
 # %% [markdown]
 # ## 2. Biological process identification
@@ -554,6 +549,16 @@ print(
 # | **decoupler** | Activity Inference (ULM/MLM) | Gene score matrix + Prior Knowledge | Regression-based; identifies specific regulatory drivers (e.g., TFs) using curated networks |
 
 # %% [markdown]
+# Each tool operates on the gene-level interpretability scores produced by DRVI's built-in scoring API (`model.get_interpretability_scores`). DRVI provides two complementary scoring approaches that can be selected via config variables later:
+#
+# - **OOD (Out-of-Distribution)**: Uses decoder reconstructions to calculate per-gene effect scores. This is our suggested method to consider for finding cell-types and most specific genes of a program. This is stored with `"OOD_combined"` key.
+# - **IND (withIN-Distribution)**: Iterates over all cells to compute weighted mean effects. Captures broader mechanistic effects including shared genes. This is stored with `"IND_linear_weighted_mean"` key.
+#
+# All tools in this notebook are **guiding tools**: they summarize large gene-level patterns into interpretable scores, but they do **not** provide definitive labels. Their outputs should always be interpreted in context, compared across methods, and validated against known biology and the original data.
+
+# %%
+
+# %% [markdown]
 # ### 2.1 BlitzGSEA
 #
 # [BlitzGSEA](https://github.com/MaayanLab/blitzgsea) performs pre-ranked Gene Set Enrichment Analysis using an analytical approximation of the null distribution rather than permutations, enabling high-performance enrichment testing across many factors.
@@ -563,53 +568,89 @@ print(
 # - **Database**: Compatible with any standard .gmt file or Enrichr library (e.g., MSigDB, Reactome)
 
 # %%
+import blitzgsea as blitz
+
+# %% [markdown]
+# #### Config
+
+# %%
 # Enrichr library to use. See Appendix for available databases.
 # Common choices: "MSigDB_Hallmark_2020", "GO_Biological_Process_2023",
 #                 "Reactome_2022", "KEGG_2021_Human"
 
 gsea_db = "GO_Biological_Process_2023"
 
-# %%
-import blitzgsea as blitz
+# Interpretability method
+# "OOD_combined" — Out-of-distribution: uses decoder reconstructions (more specific genes, shared genes are penalized)
+# "IND_linear_weighted_mean" — Within-distribution: iterates over all cells (captures broader effects and includes shared genes)
 
+score_key = "OOD_combined"
+
+# Significance threshold
+fdr_threshold = 0.05
+
+print(f"GSEA DB: {gsea_db}")
+print(f"Score key: {score_key}")
+print(f"FDR threshold: {fdr_threshold}")
+
+# %%
 signature_lib = blitz.enrichr.get_library(gsea_db)
 print(f"Loaded {gsea_db}: {len(signature_lib)} gene sets")
+
+# %% [markdown]
+# #### Prepare data
+
+# %%
+# once again: you can set score_key in main config of the notebook
+scores_df = model.get_interpretability_scores(embed, adata, key=score_key)
+scores_df
+
+# %% [markdown]
+# #### Enrichment
 
 # %%
 blitzgsea_rows = []
 
-for fac in factor_ids:
-    for direction, ranked_dict in [("pos", pos_ranked), ("neg", neg_ranked)]:
-        factor_label = f"{fac}+" if direction == "pos" else f"{fac}-"
-        series = ranked_dict[fac]
+for factor_label in scores_df.columns:
+    series = scores_df[factor_label]
 
-        # BlitzGSEA expects a DataFrame with columns "i" (gene) and "v" (score)
-        signature = series.rename("v").reset_index().rename(columns={"index": "i"})
-        signature["v"] = pd.to_numeric(signature["v"], errors="coerce")
-        signature = signature.replace([np.inf, -np.inf], np.nan).dropna(subset=["v"])
+    # BlitzGSEA expects a DataFrame with columns "i" (gene) and "v" (score)
+    signature = series.rename("v").reset_index().rename(columns={"index": "i"})
+    signature["v"] = pd.to_numeric(signature["v"], errors="coerce")
+    signature = signature.replace([np.inf, -np.inf], np.nan).dropna(subset=["v"])
 
-        try:
-            res = blitz.gsea(signature, signature_lib, processes=4)
-            sig = res[res["fdr"] < fdr_threshold].sort_values("fdr")
-            if len(sig):
-                # Keep up to the top 3 most significant terms per factor-direction
-                top_sig = sig.head(3)
-                for term, row in top_sig.iterrows():
-                    blitzgsea_rows.append({
-                        "factor": factor_label,
-                        "term": term,
-                        "NES": round(float(row["nes"]), 3),
-                        "FDR": float(row["fdr"]),
-                    })
-        except Exception as e:
-            print(f"BlitzGSEA failed for {factor_label}: {e}")
+    try:
+        res = blitz.gsea(signature, signature_lib, processes=4)
+        sig = res[res["fdr"] < fdr_threshold].sort_values("fdr")
+        if len(sig):
+            # Keep up to the top 3 most significant terms per factor-direction
+            top_sig = sig.head(3)
+            for term, row in top_sig.iterrows():
+                blitzgsea_rows.append({
+                    "factor": factor_label,
+                    "term": term,
+                    "NES": round(float(row["nes"]), 3),
+                    "FDR": float(row["fdr"]),
+                })
+    except Exception as e:
+        print(f"BlitzGSEA failed for {factor_label}: {e}")
 
+# %%
 blitzgsea_results = pd.DataFrame(blitzgsea_rows)
 print(
-    f"BlitzGSEA significant directions: {blitzgsea_results['factor'].nunique()} / {len(factor_dir_labels)} "
+    f"BlitzGSEA significant directions: {blitzgsea_results['factor'].nunique()} / {scores_df.shape[1]} "
     f"(with up to 3 terms per direction)"
 )
-display(blitzgsea_results.sort_values(["factor", "FDR"]))
+blitzgsea_results.sort_values(["factor", "FDR"])
+
+# %% [markdown]
+# #### Store results
+
+# %%
+# dtype conversion is to be able to write as h5ad
+embed.uns[f'blitzgsea_{gsea_db}_results'] = blitzgsea_results.convert_dtypes(convert_integer=False, convert_floating=False)
+
+# %%
 
 # %% [markdown]
 # ### 2.2 g:Profiler
@@ -630,6 +671,12 @@ display(blitzgsea_results.sort_values(["factor", "FDR"]))
 # **Key configuration** (set in the next cell): `organism` (e.g. `"hsapiens"`, `"mmusculus"`) and `gp_source` (e.g. `["GO:BP"]`, `["REAC"]`).
 
 # %%
+from gprofiler import GProfiler
+
+# %% [markdown]
+# #### Config
+
+# %%
 # Organism string. Common values: "hsapiens", "mmusculus", "drerio"
 organism = "hsapiens"
 
@@ -637,13 +684,40 @@ organism = "hsapiens"
 # Common choices: ["GO:BP"], ["GO:MF"], ["GO:CC"], ["REAC"], ["KEGG"], ["HP"]
 gp_source = ["GO:BP"]
 
-# %%
-from gprofiler import GProfiler
+# Interpretability method
+# "OOD_combined" — Out-of-distribution: uses decoder reconstructions (more specific genes, shared genes are penalized)
+# "IND_linear_weighted_mean" — Within-distribution: iterates over all cells (captures broader effects and includes shared genes)
 
+score_key = "OOD_combined"
+# Gene-set filtering criteria
+drvi_score_cutoff = 0.5  # Practically 0.1 for OOD and 0.5 for IND should be good values
+drvi_n_top_genes = 100  # maximum top genes per program to consider
+
+# Significance threshold
+pval_threshold = 0.05
+
+print(f"Organism: {organism}")
+print(f"GP Sources: {gp_source}")
+print(f"Score key: {score_key}")
+print(f"Cutoff - min score : {drvi_score_cutoff}")
+print(f"Cutoff - maximum # of top genes: {drvi_n_top_genes}")
+print(f"P-val culoff threshold: {pval_threshold}")
+
+# %% [markdown]
+# #### Prepare data
+
+# %%
+# once again: you can set score_key in main config of the notebook
+scores_df = model.get_interpretability_scores(embed, adata, key=score_key)
+scores_df
+
+# %% [markdown]
+# #### Enrichment
+
+# %%
 gp = GProfiler(return_dataframe=True)
 
-
-def run_gprofiler_for_factor(genes, factor_label):
+def run_gprofiler_for_factor(genes, background, factor_label):
     """Run g:Profiler ordered-query ORA for a single factor-direction."""
     genes = pd.Series(genes).dropna().astype(str).drop_duplicates().tolist()
     if not genes:
@@ -654,8 +728,8 @@ def run_gprofiler_for_factor(genes, factor_label):
         query=genes,
         sources=gp_source,
         ordered=True,
-        user_threshold=fdr_threshold,
-        background=all_genes,
+        user_threshold=pval_threshold,
+        background=background,
     )
     if res is None or res.empty:
         return pd.DataFrame()
@@ -668,53 +742,33 @@ def run_gprofiler_for_factor(genes, factor_label):
 # %%
 gprofiler_parts = []
 
-for fac in factor_ids:
-    for direction, ranked_dict in [("pos", pos_ranked), ("neg", neg_ranked)]:
-        factor_label = f"{fac}+" if direction == "pos" else f"{fac}-"
-        genes = ranked_dict[fac].index.tolist()
-        gprofiler_parts.append(run_gprofiler_for_factor(genes, factor_label))
-
-gprofiler_all = pd.concat(
-    [x for x in gprofiler_parts if not x.empty], ignore_index=True
-) if any(not x.empty for x in gprofiler_parts) else pd.DataFrame()
-
-sig = gprofiler_all[gprofiler_all["p_value"] < fdr_threshold].copy()
-print(
-    f"g:Profiler results: {len(sig)} significant rows across "
-    f"{sig['factor'].nunique()} factor-directions "
-    f"(g:SCS-corrected p < {fdr_threshold})."
-)
-
-# %% [markdown]
-# #### Explore top pathway terms per factor-direction
+for factor_label in scores_df.columns:
+    series = scores_df[factor_label].copy().sort_values(ascending=False)
+    top_genes = series[series > drvi_score_cutoff][:drvi_n_top_genes].index.to_list()
+    if len(top_genes) < 3:
+        continue
+    background = series.index.to_list()
+    gprofiler_parts.append(run_gprofiler_for_factor(top_genes, background, factor_label))
 
 # %%
-# Example: "DR 2+", "DR 36-", etc.
-factor_to_inspect = "DR 2+"
-top_n_gp_terms = 10  # or 5, as you prefer
+gprofiler_results = pd.concat(
+    [x for x in gprofiler_parts if not x.empty], ignore_index=True
+) if any(not x.empty for x in gprofiler_parts) else pd.DataFrame()
+gprofiler_results = gprofiler_results[gprofiler_results["p_value"] < pval_threshold].copy()
 
-if not gprofiler_all.empty:
-    available = sorted(gprofiler_all["factor"].unique())
-    print(f"Available factor-directions ({len(available)}): {available[:10]}{' ...' if len(available) > 10 else ''}\n")
+print(
+    f"Profiler significant directions: {gprofiler_results['factor'].nunique()} / {scores_df.shape[1]}"
+)
+gprofiler_results['parents'] = gprofiler_results['parents'].astype(str)
+gprofiler_results.sort_values(["factor", "p_value"])
 
-    df_fac = gprofiler_all[
-        (gprofiler_all["factor"] == factor_to_inspect)
-        & (gprofiler_all["p_value"] < fdr_threshold)
-    ].copy()
+# %% [markdown]
+# #### Store results
 
-    if df_fac.empty:
-        print(f"No significant g:Profiler terms for factor {factor_to_inspect} at this threshold.")
-    else:
-        df_fac = (
-            df_fac.sort_values("p_value")
-            [["factor", "name", "p_value", "intersection_size", "term_size"]]
-            .rename(columns={"name": "term"})
-            .head(top_n_gp_terms)
-        )
-        print(f"Top {len(df_fac)} g:Profiler terms for {factor_to_inspect}:")
-        display(df_fac)
-else:
-    print("gprofiler_all is empty — run the g:Profiler enrichment cell above first.")
+# %%
+embed.uns[f'gprofiler_results'] = gprofiler_results.convert_dtypes(convert_integer=False, convert_floating=False)
+
+# %%
 
 # %% [markdown]
 # ### 2.3 decoupler
@@ -738,6 +792,13 @@ else:
 # - **`dc_geneset`**: network size scales runtime linearly. CollecTRI (~1,185 regulators) is slowest; DoRothEA A-B (~500) is ~2x faster at some coverage cost.
 
 # %%
+import decoupler as dc
+from statsmodels.stats.multitest import multipletests
+
+# %% [markdown]
+# #### Config
+
+# %%
 # Gene set / network to use.
 # Recommended options for factor annotation: "collectri", "dorothea".
 # PROGENy ("progeny") is more pathway-focused and may give few strong hits
@@ -750,9 +811,21 @@ dc_organism = "human"
 dc_methods = ["ulm", "zscore"]
 dc_min = 10 
 
-# %%
-import decoupler as dc
-from statsmodels.stats.multitest import multipletests
+# Interpretability method
+# "OOD_combined" — Out-of-distribution: uses decoder reconstructions (more specific genes, shared genes are penalized)
+# "IND_linear_weighted_mean" — Within-distribution: iterates over all cells (captures broader effects and includes shared genes)
+
+score_key = "OOD_combined"
+# Gene-set filtering criteria
+drvi_score_cutoff = 0.05  # Practically 0.01 for OOD and 0.05 for IND should be good values. Values below this will be zerod.
+
+# Significance threshold
+fdr_threshold = 0.05
+
+print(f"Organism: {dc_organism}")
+print(f"Gene-set: {dc_geneset}")
+print(f"Score key: {score_key}")
+print(f"FDR threshold: {fdr_threshold}")
 
 # %%
 # Load the prior knowledge network for the selected gene set resource.
@@ -770,6 +843,17 @@ cols = ["source", "target"] + (["weight"] if "weight" in net.columns else [])
 net = net[cols].dropna().drop_duplicates().reset_index(drop=True)
 print(f"Network: {len(net)} interactions, {net['source'].nunique()} regulators")
 
+# %% [markdown]
+# #### Prepare data
+
+# %%
+# once again: you can set score_key in main config of the notebook
+scores_df = model.get_interpretability_scores(embed, adata, key=score_key)
+scores_df
+
+
+# %% [markdown]
+# #### Run
 
 # %%
 def run_decouple(df_factors_by_genes):
@@ -806,15 +890,12 @@ def run_decouple(df_factors_by_genes):
     return out[["factor", "term", "p_value", "p_adj"]]
 
 
-# Build a factor-directions x genes matrix for both positive and negative directions.
-pos_T = pos_std.T.copy()
-pos_T.index = [f"{f}+" for f in pos_T.index]
-neg_T = neg_std.T.copy()
-neg_T.index = [f"{f}-" for f in neg_T.index]
-combined_std = pd.concat([pos_T, neg_T], axis=0)
+# %%
+input_df = scores_df.copy()
+input_df[input_df < drvi_score_cutoff] = 0
+decoupler_all = run_decouple(input_df.T)
 
-decoupler_all = run_decouple(combined_std)
-
+# %%
 # Keep the most significant regulator per factor-direction for a summary view.
 decoupler_results = (
     decoupler_all[decoupler_all["p_adj"] < fdr_threshold]
@@ -826,198 +907,31 @@ decoupler_results = (
 
 print(
     f"decoupler significant regulators for "
-    f"{decoupler_results['factor'].nunique()} / {len(factor_dir_labels)} factor-directions "
+    f"{decoupler_results['factor'].nunique()} / {scores_df.shape[1]} factor-directions "
     f"(top 1 regulator per direction with FDR < {fdr_threshold})"
 )
-display(decoupler_results.sort_values("p_adj"))
+decoupler_results.sort_values("p_adj")
 
 # %% [markdown]
-# ## 3. Curation table and export
-#
-# We now merge evidence from all tools into a single curation table. Each row represents one factor-direction, with the top hits from each tool (if significant) shown in a compact format. The table also includes the top 10 genes driving each factor-direction to facilitate manual validation via literature or LLMs.
-#
-# **Recommended workflow (code-based labeling):**
-# 1. Run the curation cells below to build the table and export a CSV template.
-# 2. Edit `MANUAL_LABELS` in the helper cell to define your final annotations per factor-direction.
-# 3. Re-run the curation and export cells to refresh the CSV with your labels.
-# 4. Run the re-import cell to store final annotations in the embedding object.
-#
+# #### Store results
 
 # %%
-# Build the base table: all factor-directions with top 10 genes
-curation_rows = []
-for fac in factor_ids:
-    for direction, ranked_dict in [("pos", pos_ranked), ("neg", neg_ranked)]:
-        factor_label = f"{fac}+" if direction == "pos" else f"{fac}-"
-        top_genes = ", ".join(ranked_dict[fac].head(10).index.tolist())
-        curation_rows.append({"factor": factor_label, "top_genes": top_genes})
-
-curation = pd.DataFrame(curation_rows)
-
-# Known-annotation SMI (section 1.1): top cell-type match per factor-direction
-known_map = {}
-if len(smi_top_matches):
-    for fac in curation["factor"].unique():
-        sub = smi_top_matches[smi_top_matches["title"] == fac]
-        if len(sub):
-            row = sub.loc[sub["value"].idxmax()]
-            known_map[fac] = f"{row['variable']} || SMI={row['value']:.2f}"
-curation["known_annotation"] = curation["factor"].map(known_map).fillna("")
-
-# CellTypist column (per factor-direction SMI; directions already in ct_significant)
-ct_map = {}
-if len(ct_significant):
-    for _, row in ct_significant.iterrows():
-        label = f"{row['cell_type']} || SMI={row['smi']:.2f}"
-        ct_map[row["factor"]] = label
-curation["celltypist"] = curation["factor"].map(ct_map).fillna("")
-
-# BlitzGSEA column (top 5 terms per factor-direction)
-bg_map = {}
-if len(blitzgsea_results):
-    for fac, grp in blitzgsea_results.sort_values("FDR").groupby("factor"):
-        top = grp.head(5)
-        bg_map[fac] = " | ".join(
-            f"{r['term']} || NES={r['NES']:.2f} || FDR={r['FDR']:.2e}"
-            for _, r in top.iterrows()
-        )
-curation["blitzgsea"] = curation["factor"].map(bg_map).fillna("")
-
-# g:Profiler column (top 10 terms per factor-direction)
-gp_map = {}
-if not gprofiler_all.empty:
-    sig = gprofiler_all[gprofiler_all["p_value"] < fdr_threshold].copy()
-    for fac, grp in sig.sort_values("p_value").groupby("factor"):
-        top = grp.head(10)
-        gp_map[fac] = " | ".join(
-            f"{r['name']} (p={r['p_value']:.2e})" for _, r in top.iterrows()
-        )
-curation["gprofiler"] = curation["factor"].map(gp_map).fillna("")
-
-# decoupler column (top 5 regulators per factor-direction)
-# Filter decoupler results to significant hits before grouping.
-dc_map = {}
-dc_sig = decoupler_all[decoupler_all["p_adj"] < fdr_threshold] if len(decoupler_all) else decoupler_all
-if len(dc_sig):
-    for fac, grp in dc_sig.sort_values("p_adj").groupby("factor"):
-        top = grp.head(5)
-        dc_map[fac] = " | ".join(
-            f"{r['term']} || p_adj={r['p_adj']:.2e}" for _, r in top.iterrows()
-        )
-curation["decoupler"] = curation["factor"].map(dc_map).fillna("")
-
-# Empty columns for manual curation (filled later via MANUAL_LABELS at import time)
-curation["manual_label"] = ""
-curation["manual_notes"] = ""
-
-display(curation)
+embed.uns[f'decoupler_{dc_geneset}_results'] = decoupler_results.convert_dtypes(convert_integer=False, convert_floating=False)
 
 # %%
-curation_path = io_dir / "factor_annotation_curation.csv"
-curation.to_csv(curation_path, index=False)
-print(f"Curation table exported to: {curation_path}")
-print("\nEdit MANUAL_LABELS in the helper cell above, then re-run the curation and export cells.")
-print("Then run the cells below to finalize and store annotations in embed.var.")
 
 # %% [markdown]
-# ### Manual labeling helper
-#
-# Edit the dictionaries below to define your final annotations. Use factor-direction labels (e.g. `"DR 2+"`, `"DR 36-"`) as keys. After editing, re-run the curation table cell above and the export cell to update the CSV with your labels.
+# ## Write back to latent anndata
 
 # %%
-# Define your final annotations here. Keys are factor-direction labels (e.g. "DR 2+", "DR 36-").
-# Example: MANUAL_LABELS = {"DR 2+": "T cell activation", "DR 36-": "Monocyte differentiation"}
-MANUAL_LABELS = {"DR 36+": "Monocyte progenitor"}
+ad.settings.allow_write_nullable_strings = True
 
-# Optional: free-text notes per factor-direction
-MANUAL_NOTES = {}
-
-
-def set_label(factor, label, notes=None):
-    """Helper to add or update a label for a factor-direction."""
-    MANUAL_LABELS[factor] = label
-    if notes is not None:
-        MANUAL_NOTES[factor] = notes
-    print(f"Set {factor} -> {label}")
-
-
-# %% [markdown]
-# ### 3.1 Re-import and finalize
-#
-# Re-import the curation CSV and store final annotations in the embedding object. The `final_label` is taken **only** from `manual_label` (as populated from `MANUAL_LABELS` in the helper cell). No automatic fallback to tool-based columns.
-
-# %%
-curation_edited = pd.read_csv(curation_path)
-
-# Apply manual labels from MANUAL_LABELS at import time (overrides any CSV edits)
-curation_edited["manual_label"] = curation_edited["factor"].map(lambda f: MANUAL_LABELS.get(f, ""))
-
-
-def pick_final_label(row):
-    """Pick final annotation: use only the manual label if provided."""
-    if pd.notna(row.get("manual_label")) and str(row["manual_label"]).strip():
-        return str(row["manual_label"]).strip(), "manual"
-    return "", "none"
-
-labels_and_sources = curation_edited.apply(pick_final_label, axis=1, result_type="expand")
-curation_edited["final_label"] = labels_and_sources[0]
-curation_edited["label_source"] = labels_and_sources[1]
-
-display(curation_edited[["factor", "final_label", "label_source"]].head(20))
-
-# %%
-# Store annotations in embed.var for persistence
-# Map factor-direction labels back to factor base names for embed.var
-# We take the "+" direction label as the primary annotation per factor
-annot_by_factor = {}
-for _, row in curation_edited.iterrows():
-    fac_base = row["factor"][:-1]  # strip +/- suffix
-    direction = row["factor"][-1]
-    if direction == "+" and row["final_label"]:
-        annot_by_factor[fac_base] = (row["final_label"], row["label_source"])
-    elif fac_base not in annot_by_factor and row["final_label"]:
-        annot_by_factor[fac_base] = (row["final_label"], row["label_source"])
-
-embed.var["annotation_final"] = embed.var["title"].map(
-    lambda t: annot_by_factor.get(t, ("", ""))[0]
-)
-embed.var["annotation_source"] = embed.var["title"].map(
-    lambda t: annot_by_factor.get(t, ("", ""))[1]
-)
-
-print("Annotations stored in embed.var:")
-display(embed.var[["title", "vanished", "annotation_final", "annotation_source"]].head(20))
-
-# %%
 embed.write_h5ad(embed_path)
 print(f"Updated embedding saved to: {embed_path}")
 
-# %% [markdown]
-# ## 4. Visual validation
-#
-# Sanity-check a few annotated factors by visualizing their activity on the UMAP alongside the preannotated cell type.
-#
-# > These plots require a per-cell annotation column in `adata.obs` (configured as `annot_col`, e.g. `final_annotation`). If your dataset does not have such annotations, you can skip this section.
+# %%
 
 # %%
-example_dims = ["DR 36"]  # Replace with factor-directions you want to visualize
-
-if annot_col is not None and example_dims:
-    drvi_factors_df = pd.DataFrame(embed_nv.X, index=embed_nv.obs_names, columns=factor_ids)
-    for dim in example_dims:
-        if dim in drvi_factors_df.columns:
-            adata.obs["_factor_check"] = drvi_factors_df[dim].reindex(adata.obs_names).values
-            annot = embed.var.set_index("title").loc[dim, "annotation_final"]
-            print(f"\n{dim} — annotated as: {annot}")
-
-            sc.pl.umap(
-                adata,
-                color=["_factor_check", annot_col],
-                ncols=2,
-                frameon=False,
-                title=[f"Factor: {dim}", annot_col],
-            )
-
 
 # %% [markdown]
 # ## Appendix: Database reference
