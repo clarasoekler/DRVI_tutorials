@@ -23,11 +23,9 @@
 #     * Existing labels
 #     * Pre-trained classifiers (CellTypist)
 #     * LLM-based annotators (AnnDictionary, CASSIA)
-#     * Marker-based enrichment (BlitzGSEA)
 #
 # 3. **Biological Process Annotation** using:
-#     * **Gene set enrichment analysis (GSEA)** — identify enriched pathways from ranked gene lists (BlitzGSEA,GSEApy Preranked)
-#     * **Over-representation analysis (ORA)** — test for enriched gene sets using ordered queries (g:Profiler, GSEApy Enrichr)
+#     * **Over-representation analysis (ORA)** — test for enriched gene sets using ordered queries (g:Profiler, Enrichr)
 #     * **Regulator activity inference** — infer transcription factor or pathway activity using a statistical framework (decoupler) integrated with prior knowledge 
 #     * **LLM-based summaries** — gs2txt
 #
@@ -62,21 +60,17 @@
 #   - **Section 1.2** For identification based on a pre-trained model with CellTypist, choose a model via `ct_model` that matches your tissue / species (e.g. `"Immune_All_Low.pkl"` for PBMC, `"Developing_Mouse_Brain.pkl"` for mouse brain).
 #   - **Sections 1.3, 1.4, 2.5 (LLM tools — shared Ollama config)** Set `OLLAMA_URL`, `OLLAMA_MODEL`, and `llm_tissue_context` (e.g. `"human immune cells (PBMC / bone marrow)"`). See the *Ollama setup guide* block just before Section 1 for details on running a local Ollama server.
 #   - **Section 1.4** For CASSIA, set `llm_species` (e.g. `"Human"`, `"Mouse"`).
-#   - **Section 2.1** For BlitzGSEA, set:
-#     - `process_blitzgsea_db` (e.g. `"GO_Biological_Process_2023"`, `"Reactome_2022"`) — for biological process enrichment.
-#     - `celltype_blitzgsea_dbs` (list, e.g. `["CellMarker_2024", "PanglaoDB_Augmented_2021"]`) — for cell-type enrichment.
-#     - `fdr_threshold` to keep significant results.
-#   - **Section 2.2** For GSEApy, set:
-#     - `gseapy_db` (e.g. `"GO_Biological_Process_2023"`) — used by both the    prerank GSEA and Enrichr ORA subsections.
-#   - **Section 2.3** For g:Profiler, set:
+#   - **Section 2.1** For Enrichr, set:
+#     - `gseapy_db` (e.g. `"GO_Biological_Process_2023"`) 
+#   - **Section 2.2** For g:Profiler, set:
 #     - `organism` (e.g. `"hsapiens"`, `"mmusculus"`).
 #     - `gp_source` to the GO / pathway collections you care about (e.g. `["GO:BP"]`, `["REAC"]`).
 #     - `pval_threshold` to keep significant results.
-#   - **Section 2.4** For decoupler, set:
+#   - **Section 2.3** For decoupler, set:
 #     - `dc_geneset` (e.g. `"collectri"`, `"dorothea"`, `"progeny"` or another resource name).
 #     - `dc_organism` to match your species (e.g. `"human"`, `"mouse"`).
 #     - `fdr_threshold` to keep significant results.
-#   - **Section 2.5** For gs2txt, set `llm_species` in `GeneSetAnnotator` (`"human"` or `"mouse"`) and `enrichment_method` (e.g. `"pathway"`).
+#   - **Section 2.4** For gs2txt, set `llm_species` in `GeneSetAnnotator` (`"human"` or `"mouse"`) and `enrichment_method` (e.g. `"pathway"`).
 
 # %% [markdown]
 # ## Requirements
@@ -84,14 +78,12 @@
 # This notebook requires the following python packages:
 # ```
 # celltypist
-# blitzgsea
 # gseapy
 # gprofiler-official
 # decoupler
 # anndict        # section 1.3 (LLM)
 # CASSIA         # section 1.4 (LLM)
-# gs2txt         # section 2.5 (LLM)
-# ```
+# gs2txt         # section 2.4 (LLM)
 
 # %% [markdown]
 # ## Contact
@@ -120,7 +112,7 @@ elif IN_COLAB and branch != "stable":
 
 if IN_COLAB:
     subprocess.check_call([sys.executable, "-m", "pip", "install",
-                           "celltypist", "blitzgsea", "gseapy",
+                           "celltypist", "gseapy",
                            "gprofiler-official", "decoupler",
                            "anndict", "CASSIA", "gs2txt"])
 
@@ -227,7 +219,7 @@ import requests
 
 # %%
 # OLLAMA CONFIGURATION (shared by AnnDictionary, CASSIA, gs2txt)
-OLLAMA_URL   = "http://supergpu23.scidom.de:8978" #replace with your node and port if different
+OLLAMA_URL   = "http://supergpu21.scidom.de:8978" #replace with your node and port if different
 OLLAMA_MODEL = "qwen2.5:latest"
 
 llm_top_n_genes = 100
@@ -248,7 +240,7 @@ print("Available models:", [m["name"] for m in r.json().get("models", [])])
 # - **Known annotations**: We measure alignment between factors and annotated cell types via Scaled Mutual Information (SMI). We note that DRVI dimensions may be more fine grained than these annotations, resemble a process covering multiple cell types, or showing general shared processes. However, this approach allows identification of large proportion of processes. For this we need some supervised info such as:
 #   - **User annotations** (Section 1.1):  Where user has annotated its data.
 #   - **Annotation tools** (Section 1.2, 1.3 and 1.4):  User can also use pre-trained models such as CellTypist or Foundational Models to classify cells.
-# - **Enrichment**: Using GSEA/ORA methods with Cell Type databases. This is described in the **Biological Process Identification** section using BlitzGSEA.
+# - **Enrichment**: Using GSEA/ORA methods with Cell Type databases. This is not described in this tutorial (as they did not yield good results). But the same models from **Biological Process Identification** section can be used.
 
 # %% [markdown]
 # ### 1.1 Identification based on user annotations
@@ -651,7 +643,7 @@ import requests
 
 # %%
 # OLLAMA CONFIGURATION (shared by AnnDictionary, CASSIA, gs2txt)
-OLLAMA_URL   = "http://supergpu23.scidom.de:8978" #replace with your node and port if different
+OLLAMA_URL   = "http://supergpu21.scidom.de:8978" #replace with your node and port if different
 OLLAMA_MODEL = "qwen2.5:latest"
 
 llm_top_n_genes = 100
@@ -772,7 +764,7 @@ import requests
 
 # %%
 # OLLAMA CONFIGURATION (shared by AnnDictionary, CASSIA, gs2txt)
-OLLAMA_URL   = "http://supergpu23.scidom.de:8978" #replace with your node and port if different
+OLLAMA_URL   = "http://supergpu21.scidom.de:8978" #replace with your node and port if different
 OLLAMA_MODEL = "qwen2.5:latest"
 
 llm_top_n_genes = 100
@@ -883,12 +875,11 @@ embed.var.index.name = None
 # %% [markdown]
 # ## 2. Biological process identification
 #
-# Factors that do not map to a single cell type often capture biological processes (e.g., interferon response, cell cycle, stress). We use five complementary enrichment approaches:
+# Factors that do not map to a single cell type often capture biological processes (e.g., interferon response, cell cycle, stress). We use four complementary approaches:
 #
 # | Tool | Method | Input | Strengths |
 # |------|--------|-------|-----------|
-# | **BlitzGSEA** | Pre-ranked GSEA | Full ranked gene list | Fast analytical null; uses full ranking |
-# | **GSEApy**        | Pre-ranked GSEA + Enrichr ORA    | Ranked list + top-gene query | Alternative GSEA/ORA implementations |
+# | **Enrichr** via GSEApy        | Over-representation (ORA)  | Top-N query | Alternative ORA implementation (works slightly different) |
 # | **g:Profiler** | Over-representation (ORA) | Ordered gene query | Robust multiple-testing (g:SCS); well-suited for biological pathways and GO terms |
 # | **decoupler** | Activity Inference (ULM/MLM) | Gene score matrix + Prior Knowledge | Regression-based; identifies specific regulatory drivers (e.g., TFs) using curated networks |
 # | **gs2txt (LLM)**  | LLM-generated description         | Top genes | Human-readable process descriptions |
@@ -898,7 +889,7 @@ embed.var.index.name = None
 #    
 #
 #
-# > **A note on pre-ranked GSEA.** GSEA-style methods (BlitzGSEA's process track, GSEApy prerank) are designed for signed, two-sided rankings — genes at the top are up-regulated, genes at the bottom are down-regulated, and the test asks whether a gene set is concentrated at either end. DRVI interpretability scores are non-negative by construction (each factor-direction has its own positive ranking), so there is no meaningful "bottom" of the ranking for GSEA to exploit. On this dataset both tools returned very few significant hits (2–10 of 116 factor-directions) and the hits they did return were not more informative than the ORA results below. For that reason we restrict Section 2 to ORA-based enrichment (Enrichr, g:Profiler) plus the TF-activity and LLM approaches that follow.
+# > **A note on pre-ranked GSEA.** GSEA-style methods (e.g BlitzGSEA's process track, GSEApy prerank) are designed for signed, two-sided rankings — genes at the top are up-regulated, genes at the bottom are down-regulated, and the test asks whether a gene set is concentrated at either end. DRVI interpretability scores are non-negative by construction (each factor-direction has its own positive ranking), so there is no meaningful "bottom" of the ranking for GSEA to exploit. On this dataset both tools returned very few significant hits (2–10 of 116 factor-directions) and the hits they did return were not more informative than the ORA results below. For that reason we restrict Section 2 to ORA-based enrichment (Enrichr, g:Profiler) plus the TF-activity and LLM approaches that follow.
 #     
 #
 
@@ -911,110 +902,11 @@ embed.var.index.name = None
 # All results below are **guiding**: interpret in context and validate against known biology.
 
 # %% [markdown]
-# ### 2.1 BlitzGSEA
+# ### 2.1 Enrichr via GSEApy
 #
-# [BlitzGSEA](https://github.com/MaayanLab/blitzgsea) performs pre-ranked GSEA using an analytical null distribution (no permutations). It can be used to annotate biological processes or cell types using data bases accordingly. Here we do both.
+# [GSEApy](https://github.com/zqfang/GSEApy) provides both prerank GSEA (permutation-based null) and Enrichr ORA. Here we will use Enrichr ORA. 
 #
-# - **Input**: Full ranked gene list (genes sorted by their DRVI effect scores, capturing the magnitude and direction of expression change)
-# - **Output**: Normalized Enrichment Score (NES) and FDR-adjusted p-values per gene set
-# - **Database**: Compatible with any standard .gmt file or Enrichr library (e.g., MSigDB, Reactome)
-
-# %% [markdown]
-# #### Imports
-
-# %%
-import blitzgsea as blitz
-
-# %% [markdown]
-# #### Config
-
-# %%
-# Enrichr library to use. See Appendix for available databases.
-# Common choices: "MSigDB_Hallmark_2020", "GO_Biological_Process_2023",
-#                 "Reactome_2022", "KEGG_2021_Human"
-process_blitzgsea_db = "GO_Biological_Process_2023"
-celltype_blitzgsea_dbs = ["CellMarker_2024", "PanglaoDB_Augmented_2021"]
-
-# Interpretability method
-# "OOD_combined" — Out-of-distribution: uses decoder reconstructions (more specific genes, shared genes are penalized)
-# "IND_linear_weighted_mean" — Within-distribution: iterates over all cells (captures broader effects and includes shared genes)
-score_key = "OOD_combined"
-
-# Significance threshold
-fdr_threshold = 0.05
-
-# %% [markdown]
-# #### Prepare data
-
-# %%
-# once again: you can set score_key in main config of the notebook
-scores_df = model.get_interpretability_scores(embed, adata, key=score_key)
-
-
-# %% [markdown]
-# #### Enrichment
-
-# %%
-def run_blitzgsea(scores_df, library, fdr_cutoff):
-    rows = []
-    for factor_label in scores_df.columns:
-        sig = scores_df[factor_label].reset_index()
-        try:
-            res = blitz.gsea(sig, library)
-        except Exception as e:
-            print(f"BlitzGSEA failed for {factor_label}: {e}")
-            continue
-        hits = res[res["fdr"] < fdr_cutoff].sort_values("fdr")
-        hits.index.name = "Term"
-        rows.append(hits.reset_index().assign(factor=factor_label))
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-
-
-# %% [markdown]
-# #### Run Cell Type Enrichment
-
-# %%
-celltype_blitzgsea_results = pd.concat([
-    run_blitzgsea(scores_df, blitz.enrichr.get_library(db), fdr_threshold).assign(database=db)
-    for db in celltype_blitzgsea_dbs
-], ignore_index=True)
-
-print(f"Cell Type significant directions: {celltype_blitzgsea_results['factor'].nunique()} / {scores_df.shape[1]}")
-
-# %% [markdown]
-# #### Run Biological Process Enrichment
-
-# %%
-process_blitzgsea_results = run_blitzgsea(
-    scores_df, blitz.enrichr.get_library(process_blitzgsea_db), fdr_threshold
-)
-
-print(f"Process significant directions: {process_blitzgsea_results['factor'].nunique()} / {scores_df.shape[1]}")
-
-# %% [markdown]
-# #### Store results
-
-# %%
-display(celltype_blitzgsea_results.head(3))
-display(process_blitzgsea_results.sort_values(["factor", "fdr"]).head(3))
-
-# %%
-# dtype conversion is needed to be able to write as h5ad
-embed.uns["celltype_gsea_results"] = celltype_blitzgsea_results.convert_dtypes(
-    convert_integer=False, convert_floating=False
-)
-embed.uns["process_blitzgsea_results"] = process_blitzgsea_results.convert_dtypes(
-    convert_integer=False, convert_floating=False
-)
-
-# %% [markdown]
-# ### 2.2 GSEApy
-#
-# [GSEApy](https://github.com/zqfang/GSEApy) provides both prerank GSEA (permutation-based null) and Enrichr ORA. Useful as a second opinion alongside BlitzGSEA and g:Profiler.
-#
-# - **Input**: 
-#     * Prerank: Full ranked gene list (genes sorted by their DRVI effect scores).
-#     * Enrichr (ORA): Filtered gene lists (top genes based on a specific DRVI score cutoff).
+# - **Input**: Filtered gene lists (top genes based on a specific DRVI score cutoff).
 # - **Output**: NES and FDR for Prerank; Adjusted p-values for ORA.
 # - **Database**: Extensive support for Enrichr libraries (e.g., GO, MSigDB, KEGG), BioMart, and standard .gmt files.
 #
@@ -1037,10 +929,6 @@ gseapy_db = "GO_Biological_Process_2023"
 # "IND_linear_weighted_mean" — Within-distribution: iterates over all cells (captures broader effects and includes shared genes)
 score_key = "OOD_combined"
 
-# Prerank GSEA: uses full ranked gene list
-prerank_permutations = 1000  # gseapy default; lower = faster but coarser p-values
-fdr_threshold = 0.05   
-
 # Enrichr ORA: uses top genes per factor as a query
 drvi_score_cutoff = 0.1       # practically 0.1 for OOD, 0.5 for IND
 top_n_genes = 100
@@ -1057,24 +945,6 @@ gene_background = adata_full.var_names.tolist()
 
 # %% [markdown]
 # #### Helper Functions
-
-# %%
-def run_gseapy_prerank(scores_df, gene_sets, permutations, fdr_cutoff):
-    rows = []
-    for col in scores_df.columns:
-        rnk = scores_df[col].dropna().sort_values(ascending=False)
-        try:
-            pre = gseapy.prerank(
-                rnk=rnk, gene_sets=gene_sets, permutation_num=permutations,
-                no_plot=True, verbose=False, outdir=None,
-            )
-        except Exception as e:
-            print(f"Prerank failed for {col}: {e}")
-            continue
-        hits = pre.res2d[pre.res2d["FDR q-val"] < fdr_cutoff].sort_values("FDR q-val")
-        rows.append(hits.assign(factor=col))
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-
 
 # %%
 def run_gseapy_enrichr(scores_df, gene_sets, cutoff, top_n, padj_cutoff, background):
@@ -1100,25 +970,18 @@ def run_gseapy_enrichr(scores_df, gene_sets, cutoff, top_n, padj_cutoff, backgro
 # #### Run Enrichment
 
 # %%
-gseapy_prerank_results = run_gseapy_prerank(
-    scores_df, gseapy_db, prerank_permutations, fdr_threshold
-)
-
 gseapy_enrichr_results = run_gseapy_enrichr(
     scores_df, gseapy_db, drvi_score_cutoff, top_n_genes, padj_threshold, gene_background
 )
 
-display(gseapy_prerank_results.head(5))
 display(gseapy_enrichr_results.head(5))
 
 # %% [markdown]
 # #### Store results
 
 # %%
-embed.uns['gseapy_prerank_results'] = gseapy_prerank_results.convert_dtypes(convert_integer=False, convert_floating=False)
 embed.uns['gseapy_enrichr_results'] = gseapy_enrichr_results.convert_dtypes(convert_integer=False, convert_floating=False)
 
-print(f"Prerank significant factor directions: {gseapy_prerank_results['factor'].nunique() if not gseapy_prerank_results.empty else 0}/ {scores_df.shape[1]}")
 print(f"Enrichr significant factor directions: {gseapy_enrichr_results['factor'].nunique() if not gseapy_enrichr_results.empty else 0}/ {scores_df.shape[1]}")
 
 # %% [markdown]
@@ -1137,7 +1000,7 @@ print(f"Enrichr significant factor directions: {gseapy_enrichr_results['factor']
 # Enrichment quality is bounded by the database. Factors whose biology is less well represented in GO:BP tend to return loosely related terms (e.g. DR 17− erythroid → receptor internalization, thyroid hormone response; DR 15− HSPCs → miRNA transcription, inflammatory response). This reflects a coverage limitation rather than an algorithmic failure, and is one reason to apply more than one process tool. Used alongside g:Profiler, the two ORA approaches can cross-validate one another, and discrepancies can indicate factors where individual calls should be interpreted with additional caution.
 
 # %% [markdown]
-# ### 2.3 g:Profiler
+# ### 2.2 g:Profiler
 #
 # [g:Profiler](https://biit.cs.ut.ee/gprofiler/) performs ORA via a hypergeometric test with g:SCS correction (optimized for hierarchical GO terms).
 # **ordered-query** mode it processes the ranked gene list iteratively to find the optimal gene-set size for enrichment, making it more sensitive than using a fixed "top-N" cutoff for continuous latent factor scores.
@@ -1162,7 +1025,7 @@ organism = "hsapiens"       # e.g. "mmusculus", "drerio"
 # Common choices: ["GO:BP"], ["GO:MF"], ["GO:CC"], ["REAC"], ["KEGG"], ["HP"]
 gp_source = ["GO:BP"]
 
-ordered = True # whether to order genes by their DRVI score (like prerank) or use top genes as an unordered list (like ORA)
+ordered = True # whether to order genes by their DRVI score (GSEA-style ranked query) or use top genes as an unordered list (like ORA)
 
 # Interpretability method
 # "OOD_combined" — Out-of-distribution: uses decoder reconstructions (more specific genes, shared genes are penalized)
@@ -1246,7 +1109,7 @@ embed.uns[f'gprofiler_results'] = gprofiler_results.convert_dtypes(convert_integ
 # Coverage is lower than Enrichr (29 vs 54 of 116 factor-directions), and the same database limitation applies: factors whose biology is not well represented in GO:BP tend to return few or no significant terms. The two ORA tools are best interpreted together, with convergent calls treated as better supported than single-tool calls.
 
 # %% [markdown]
-# ### 2.4 decoupler
+# ### 2.3 decoupler
 #
 # [decoupler](https://decoupler-py.readthedocs.io/) uses regression-based methods (Univariate/Multivariate Linear Models, z-score) and weighted sums to infer the activity of regulators from gene-level scores. Unlike enrichment-based methods, it models the relationship between observed gene scores and a Prior Knowledge Network (PKN), quantifying the specific influence of a regulator.
 #
@@ -1360,9 +1223,6 @@ decoupler_results = (
 print(f"Significant regulators for {decoupler_results['factor'].nunique()} / {scores_df.shape[1]} directions.")
 display(decoupler_results.sort_values("p_adj"))
 
-# %%
-display(decoupler_results.sort_values("p_adj"))
-
 # %% [markdown]
 # #### Store results
 
@@ -1387,7 +1247,7 @@ embed.uns["decoupler_results"] = decoupler_results.convert_dtypes(convert_intege
 # Within these limitations, decoupler can be informative for factors that appear to represent regulatory programmes, providing a candidate upstream driver that complements the cell-type and process-level annotations from the other tools.
 
 # %% [markdown]
-# ### 2.5 gs2txt (LLM)
+# ### 2.4 gs2txt (LLM)
 # gs2txt first runs pathway enrichment on the input gene set (optional), then combines the gene functions with enrichment results into a structured prompt for the LLM, which produces a biological process description.
 #
 # - **Input**: Gene list with scores (top-N genes by DRVI effect score), formatted as a DataFrame with `gene` and `logFC` columns
@@ -1412,7 +1272,7 @@ from gs2txt.llm import OpenAIProvider
 
 # %%
 # OLLAMA CONFIGURATION (shared by AnnDictionary, CASSIA, gs2txt)
-OLLAMA_URL   = "http://supergpu23.scidom.de:8978" #replace with your node and port if different
+OLLAMA_URL   = "http://supergpu21.scidom.de:8978" #replace with your node and port if different
 OLLAMA_MODEL = "qwen2.5:latest"
 
 llm_top_n_genes = 100
@@ -1572,9 +1432,6 @@ annot_col = "final_annotation"
 # %%
 # Top-N terms shown per enrichment tool
 CURATION_TOP_N = {
-    "celltype_blitzgsea": 1,
-    "process_blitzgsea":  3,
-    "gseapy_prerank":     3,
     "gseapy_enrichr":     3,
     "gprofiler":          5,
     "decoupler":          1,
@@ -1582,9 +1439,6 @@ CURATION_TOP_N = {
 
 # %%
 ENRICHMENT_TOOLS = [
-    ("celltype_blitzgsea", "celltype_gsea_results",        "Term"),
-    ("process_blitzgsea",  "process_blitzgsea_results",    "Term"),
-    ("gseapy_prerank",     "gseapy_prerank_results",       "Term"),
     ("gseapy_enrichr",     "gseapy_enrichr_results",       "Term"),
     ("gprofiler",          "gprofiler_results",            "name"),
     ("decoupler",          "decoupler_results",            "term"),
@@ -1723,11 +1577,11 @@ print(f"Saved to: {embed_path}")
 # %% [markdown]
 # ## 5. Appendix: Database reference
 #
-# Swap the tool-specific config variables above (`process_blitzgsea_db`, `celltype_blitzgsea_dbs`, `gp_source`, `dc_geneset`, `gseapy_db`, `celltype_db`) to use different databases.
+# Swap the tool-specific config variables above ( `gp_source`, `dc_geneset`, `gseapy_db`) to use different databases.
 #
-# ### Cell type marker databases (BlitzGSEA ORA only)
+# ### Cell type marker databases (Enrichr)
 #
-# | Database | Description | BlitzGSEA name |
+# | Database | Description | Enrichr library name |
 # |----------|-------------|----------------|
 # | CellMarker 2.0 | Curated cell type markers from literature | `CellMarker_2024` |
 # | PanglaoDB | Curated markers from scRNA-seq studies | `PanglaoDB_Augmented_2021` |
@@ -1737,10 +1591,9 @@ print(f"Saved to: {embed_path}")
 # | Human Gene Atlas | Tissue/cell type expression profiles | `Human_Gene_Atlas` |
 #
 #
-#
 # ### Biological process databases
 #
-# | Database | Description | BlitzGSEA/GSEApy| g:Profiler | 
+# | Database | Description | Enrichr library name | g:Profiler | 
 # |----------|-------------|-------------------|------------|
 # | MSigDB Hallmark | 50 well curated non redundant biological states | `MSigDB_Hallmark_2020` | — |
 # | GO Biological Process | Comprehensive hierarchical processes | `GO_Biological_Process_2025` | `GO:BP` |
@@ -1760,7 +1613,7 @@ print(f"Saved to: {embed_path}")
 #
 # ### Clinical and Disease Phenotypes
 #
-# | Database | Description | BlitzGSEA| g:Profiler |
+# | Database | Description | Enrichr | g:Profiler |
 # |----------|-------------|-------------------|------------|
 # | Human Phenotype Ont. | Genes linked to clinical signs | Human_Phenotype_Ontology | HP |
 # | OMIM | Human genes and genetic disorders | OMIM_Disease | OMIM
